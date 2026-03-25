@@ -1,0 +1,541 @@
+{
+  "scriptId": "1DRoUCOvvCzyHAkP3ytfqWyjTOt6c7dQLuawfSDX_naKHv--WPTSiRl53",
+  "exportedAt": "2026-03-25T15:48:49.114Z",
+  "files": [
+    {
+      "name": "appsscript",
+      "type": "JSON",
+      "source": "{\n  \"timeZone\": \"America/New_York\",\n  \"dependencies\": {\n    \"enabledAdvancedServices\": [\n      {\n        \"userSymbol\": \"Sheets\",\n        \"version\": \"v4\",\n        \"serviceId\": \"sheets\"\n      }\n    ]\n  },\n  \"exceptionLogging\": \"STACKDRIVER\",\n  \"runtimeVersion\": \"V8\",\n  \"oauthScopes\": [\n    \"https://www.googleapis.com/auth/script.projects\",\n    \"https://www.googleapis.com/auth/script.external_request\",\n    \"https://www.googleapis.com/auth/script.container.ui\"\n  ]\n}",
+      "lastModifyUser": {
+        "domain": "bellmech.com",
+        "email": "blake@bellmech.com",
+        "name": "Blake Bennett",
+        "photoUrl": "https://lh3.googleusercontent.com/a/ACg8ocI4azoPqdnaq5N-wsG2B9uF-cVybOe6LZwpNAHKrecBvUw-9Q=h128"
+      },
+      "createTime": "2026-02-02T17:08:55.463Z",
+      "updateTime": "2026-03-25T15:48:37.446Z",
+      "functionSet": {}
+    },
+    {
+      "name": "BizPro Import / Parse",
+      "type": "SERVER_JS",
+      "source": "/**\n * HVACBizPro IMPORT + PARSE (Gmail -> Raw -> Jobs)\n *\n * RULES:\n * 1) NEVER overwrite existing rows in \"HVACBizPro Jobs\"\n *    - Existing parsed rows are identified by Message ID in column A\n *    - If Message ID already exists in Jobs column A, skip it\n *    - This preserves any manual edits in the Jobs tab\n *\n * 2) Raw import still appends only new emails into \"HVACBizPro Raw Emails\"\n *    - Message ID key in Raw column A\n *\n * 3) NO duplicates\n *    - Raw dedupes by Message ID in column A\n *    - Jobs dedupes by Message ID in column A\n *\n * SHEETS:\n * - Raw:  \"HVACBizPro Raw Emails\"\n *   A=Message ID, B=Gmail Date, C=From, D=Subject, E=Plain Body\n *\n * - Jobs: \"HVACBizPro Jobs\"\n *   A=Message ID (parse key)\n */\n\nconst HVACBIZPRO = {\n  SPREADSHEET_ID: \"\",\n\n  SHEET_RAW: \"HVACBizPro Raw Emails\",\n  SHEET_JOBS: \"HVACBizPro Jobs\",\n\n  GMAIL_QUERY: 'from:communications@hvacbizpro.com subject:\"Financial Summary\"',\n  THREAD_PAGE_SIZE: 200,\n  MAX_PAGES: 50,\n  WRITE_BATCH_SIZE: 200\n};\n\nfunction hvacBizPro_ImportAndParse() {\n  logExec_(\"RUN_START\", \"hvacBizPro_ImportAndParse\");\n\n  const ss = getSpreadsheet_();\n  const shRaw = getOrCreateSheet_(ss, HVACBIZPRO.SHEET_RAW, rawHeaders_());\n  const shJobs = getOrCreateSheet_(ss, HVACBIZPRO.SHEET_JOBS, jobHeaders_());\n\n  // Ensure headers exist\n  shRaw.getRange(1, 1, 1, rawHeaders_()[0].length).setValues(rawHeaders_());\n  shRaw.setFrozenRows(1);\n\n  shJobs.getRange(1, 1, 1, jobHeaders_()[0].length).setValues(jobHeaders_());\n  shJobs.setFrozenRows(1);\n\n  const imported = hvacBizPro_ImportRaw_(shRaw);\n  logExec_(\"IMPORT_DONE\", `newRaw=${imported}`);\n\n  const appended = hvacBizPro_ParseAndAppendJobs_(shRaw, shJobs);\n  logExec_(\"PARSE_DONE\", `newJobs=${appended}`);\n\n  logExec_(\"RUN_END\", \"hvacBizPro_ImportAndParse\");\n}\n\nfunction hvacBizPro_ImportRaw_(shRaw) {\n  const existingMsgIds = loadExistingIdsFromColumn_(shRaw, 1); // Raw col A\n  logExec_(\"RAW_EXISTING_IDS\", `count=${existingMsgIds.size}`);\n\n  const buffer = [];\n  let totalThreads = 0;\n  let totalMessages = 0;\n  let newRows = 0;\n\n  for (let page = 0; page < HVACBIZPRO.MAX_PAGES; page++) {\n    const start = page * HVACBIZPRO.THREAD_PAGE_SIZE;\n    const threads = GmailApp.search(HVACBIZPRO.GMAIL_QUERY, start, HVACBIZPRO.THREAD_PAGE_SIZE);\n\n    logExec_(\"THREAD_PAGE\", `page=${page + 1} fetched=${threads.length} start=${start}`);\n    if (!threads.length) break;\n\n    totalThreads += threads.length;\n\n    for (const thread of threads) {\n      for (const msg of thread.getMessages()) {\n        totalMessages++;\n\n        const msgId = msg.getId();\n        if (existingMsgIds.has(msgId)) continue;\n\n        const date = msg.getDate();\n        const from = msg.getFrom() || \"\";\n        const subject = msg.getSubject() || \"\";\n        const plainBody = normalizeBody_(msg.getPlainBody() || \"\");\n\n        existingMsgIds.add(msgId);\n        buffer.push([msgId, date, from, subject, plainBody]);\n        newRows++;\n\n        if (buffer.length >= HVACBIZPRO.WRITE_BATCH_SIZE) {\n          appendRows_(shRaw, buffer);\n          buffer.length = 0;\n          logExec_(\"RAW_PROGRESS\", `newRaw=${newRows} scannedMsgs=${totalMessages}`);\n        }\n      }\n    }\n  }\n\n  if (buffer.length) appendRows_(shRaw, buffer);\n\n  logExec_(\"RAW_SUMMARY\", `threads=${totalThreads} scannedMsgs=${totalMessages} newRaw=${newRows}`);\n  return newRows;\n}\n\nfunction hvacBizPro_ParseAndAppendJobs_(shRaw, shJobs) {\n  const rawLastRow = shRaw.getLastRow();\n  if (rawLastRow < 2) return 0;\n\n  const rawValues = shRaw.getRange(2, 1, rawLastRow - 1, 5).getValues();\n  const COL_MSG_ID = 0;\n  const COL_DATE = 1;\n  const COL_SUBJECT = 3;\n  const COL_BODY = 4;\n\n  // Existing parsed keys from Jobs column A\n  const parsedMsgIds = loadExistingIdsFromColumn_(shJobs, 1);\n  logExec_(\"JOBS_EXISTING_KEYS\", `count=${parsedMsgIds.size}`);\n\n  const rowsToAppend = [];\n  let appended = 0;\n  let skippedAlreadyParsed = 0;\n  let skippedNotMatch = 0;\n\n  for (const row of rawValues) {\n    const msgId = String(row[COL_MSG_ID] ?? \"\").trim();\n    if (!msgId) continue;\n\n    // Never overwrite existing Jobs rows\n    if (parsedMsgIds.has(msgId)) {\n      skippedAlreadyParsed++;\n      continue;\n    }\n\n    const gmailDate = row[COL_DATE];\n    const subject = row[COL_SUBJECT] || \"\";\n    const body = normalizeBody_(String(row[COL_BODY] || \"\"));\n\n    if (!body || !body.toUpperCase().includes(\"PROPOSAL\") || !body.toUpperCase().includes(\"CUSTOMER\")) {\n      skippedNotMatch++;\n      continue;\n    }\n\n    const p = parseHvacBizProBody_(body);\n\n    const out = fixRowToLength_([\n      msgId,                    // A Message ID = parse key\n      gmailDate,                // B Gmail Date\n      subject,                  // C Subject\n\n      p.proposal || \"\",         // D\n      p.sales_rep || \"\",        // E\n      p.opened || \"\",           // F\n      p.closed || \"\",           // G\n      p.install || \"\",          // H\n\n      p.customer_name || \"\",    // I\n      p.address1 || \"\",         // J\n      p.city || \"\",             // K\n      p.state || \"\",            // L\n      p.zip || \"\",              // M\n      p.tel || \"\",              // N\n      p.email || \"\",            // O\n\n      p.selling_price || \"\",    // P\n      p.equipment || \"\",        // Q\n      p.parts || \"\",            // R\n      p.services || \"\",         // S\n      p.labor || \"\",            // T\n      p.tax || \"\",              // U\n      p.labor_hours || \"\",      // V\n      p.cogs || \"\",             // W\n      p.gross_margin || \"\",     // X\n      p.gross_profit || \"\",     // Y\n      p.cost_of_financing || \"\",// Z\n      p.payment_method || \"\",   // AA\n      p.commissions || \"\",      // AB\n      p.proposal_link || \"\"     // AC\n    ], jobHeaders_()[0].length);\n\n    rowsToAppend.push(out);\n    parsedMsgIds.add(msgId);\n    appended++;\n  }\n\n  if (rowsToAppend.length) {\n    appendRows_(shJobs, rowsToAppend);\n    logExec_(\"JOBS_APPENDED\", `count=${rowsToAppend.length}`);\n  }\n\n  logExec_(\"JOBS_PARSE_SUMMARY\", `appended=${appended} skippedParsed=${skippedAlreadyParsed} skippedNotMatch=${skippedNotMatch}`);\n  return appended;\n}\n\n/* =========================\n * PARSER\n * ========================= */\n\nfunction parseHvacBizProBody_(body) {\n  const cleaned = body.replace(/\\*/g, \"\");\n  const lines = cleaned.split(\"\\n\").map(l => l.trim()).filter(Boolean);\n\n  const r = {\n    proposal: findValueAfterLabel_(lines, \"PROPOSAL\"),\n    sales_rep: findValueAfterLabel_(lines, \"SALES REP\"),\n    opened: findValueAfterLabel_(lines, \"OPENED\"),\n    closed: findValueAfterLabel_(lines, \"CLOSED\"),\n    install: findValueAfterLabel_(lines, \"INSTALL\"),\n\n    customer_name: null,\n    address1: null,\n    city: null,\n    state: null,\n    zip: null,\n    tel: null,\n    email: null,\n\n    selling_price: pickValueAfterPercentFromLines_(lines, \"Selling Price\"),\n    equipment: pickValueAfterPercentFromLines_(lines, \"Equipment\"),\n    parts: pickValueAfterPercentFromLines_(lines, \"Parts\"),\n    services: pickValueAfterPercentFromLines_(lines, \"Services\"),\n    labor: pickValueAfterPercentFromLines_(lines, \"Labor\"),\n    tax: pickValueAfterPercentFromLines_(lines, \"Tax\"),\n    labor_hours: pickLastNumberFromLines_(lines, \"Labor Hours\"),\n    cogs: pickValueAfterPercentFromLines_(lines, \"COGS\"),\n    gross_margin: pickValueAfterPercentFromLines_(lines, \"Gross Margin\"),\n    gross_profit: pickLastNumberFromLines_(lines, \"Gross Profit $\"),\n    cost_of_financing: pickLastNumberFromLines_(lines, \"Cost of financing\"),\n    payment_method: null,\n    commissions: pickLastNumberFromLines_(lines, \"Commissions\"),\n\n    proposal_link: extractProposalLink_(cleaned)\n  };\n\n  const custIdx = findIndexStartsWith_(lines, \"CUSTOMER\");\n  if (custIdx >= 0) {\n    const rawName = lines[custIdx].replace(/^CUSTOMER\\s*/i, \"\").trim();\n    r.customer_name = toProperCase_(rawName);\n\n    r.address1 = lines[custIdx + 1] || null;\n\n    const cs = parseCityStateZipLoose_(lines[custIdx + 2] || \"\");\n    r.city = cs.city;\n    r.state = cs.state;\n    r.zip = cs.zip;\n\n    for (let i = custIdx + 1; i < Math.min(lines.length, custIdx + 15); i++) {\n      const l = lines[i];\n      if (/^Tel\\s*:/i.test(l)) r.tel = l.replace(/^Tel\\s*:\\s*/i, \"\").trim();\n      if (/\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b/i.test(l)) r.email = l.trim();\n    }\n  }\n\n  const payLine = findLineStartsWith_(lines, \"Payment Method\");\n  if (payLine) {\n    const m = payLine.match(/Pay by:\\s*(.+)$/i);\n    r.payment_method = m ? m[1].trim() : payLine.replace(/^Payment Method/i, \"\").trim();\n  }\n\n  return r;\n}\n\n/* =========================\n * HEADERS\n * ========================= */\n\nfunction rawHeaders_() {\n  return [[\n    \"Message ID\",\n    \"Gmail Date\",\n    \"From\",\n    \"Subject\",\n    \"Plain Body\"\n  ]];\n}\n\nfunction jobHeaders_() {\n  return [[\n    \"Message ID\",\"Gmail Date\",\"Subject\",\n    \"Proposal\",\"Sales Rep\",\"Opened\",\"Closed\",\"Install\",\n    \"Customer Name\",\"Address Line 1\",\"City\",\"State\",\"ZIP\",\"Telephone\",\"Email\",\n    \"Selling Price\",\"Equipment\",\"Parts\",\"Services\",\"Labor\",\"Tax\",\"Labor Hours\",\n    \"COGS\",\"Gross Margin\",\"Gross Profit $\",\"Cost of financing\",\"Payment Method\",\n    \"Commissions\",\"Proposal Link\"\n  ]];\n}\n\n/* =========================\n * HELPERS\n * ========================= */\n\nfunction toProperCase_(str) {\n  if (!str) return str;\n  return String(str)\n    .toLowerCase()\n    .split(/\\s+/)\n    .map(w => w ? w[0].toUpperCase() + w.slice(1) : \"\")\n    .join(\" \");\n}\n\nfunction fixRowToLength_(row, len) {\n  while (row.length < len) row.push(\"\");\n  return row.slice(0, len);\n}\n\nfunction findValueAfterLabel_(l, k) {\n  return (findLineStartsWith_(l, k) || \"\").replace(new RegExp(\"^\" + k + \"\\\\s*\", \"i\"), \"\").trim() || null;\n}\n\nfunction pickValueAfterPercentFromLines_(l, k) {\n  const x = findLineStartsWith_(l, k);\n  if (!x) return null;\n  return (x.match(/%\\s*([\\d,]+)/) || [])[1] || (x.match(/([\\d,]+)\\s*$/) || [])[1] || null;\n}\n\nfunction pickLastNumberFromLines_(l, k) {\n  const x = findLineStartsWith_(l, k);\n  return x ? (x.match(/([\\d,]+)\\s*$/) || [])[1] : null;\n}\n\nfunction findLineStartsWith_(l, k) {\n  k = k.toLowerCase();\n  return l.find(x => x.toLowerCase().startsWith(k)) || null;\n}\n\nfunction findIndexStartsWith_(l, k) {\n  k = k.toLowerCase();\n  return l.findIndex(x => x.toLowerCase().startsWith(k));\n}\n\nfunction parseCityStateZipLoose_(l) {\n  const m = l.match(/^(.+?),\\s*([A-Z]{2})\\s+(\\d{5})$/i);\n  return { city: m ? m[1] : null, state: m ? m[2] : null, zip: m ? m[3] : null };\n}\n\nfunction extractProposalLink_(b) {\n  const m = b.match(/https?:\\/\\/hvacbizpro\\.com\\/proposals\\/hardcopy\\/\\S+/i);\n  return m ? m[0] : null;\n}\n\nfunction normalizeBody_(plain) {\n  let t = String(plain || \"\").replace(/\\r\\n/g, \"\\n\").replace(/\\r/g, \"\\n\");\n  t = t.replace(/\\t+/g, \" \");\n  t = t.replace(/[ ]{2,}/g, \" \");\n  return t.trim();\n}\n\nfunction logExec_(tag, msg) {\n  const line = `${new Date().toISOString()} | ${tag} | ${msg}`;\n  Logger.log(line);\n  console.log(line);\n}\n\nfunction getSpreadsheet_() {\n  return HVACBIZPRO.SPREADSHEET_ID\n    ? SpreadsheetApp.openById(HVACBIZPRO.SPREADSHEET_ID)\n    : SpreadsheetApp.getActiveSpreadsheet();\n}\n\nfunction getOrCreateSheet_(ss, name, headers2d) {\n  let sh = ss.getSheetByName(name);\n  if (!sh) sh = ss.insertSheet(name);\n\n  const headerLen = headers2d[0].length;\n  sh.getRange(1, 1, 1, headerLen).setValues(headers2d);\n  sh.setFrozenRows(1);\n\n  return sh;\n}\n\nfunction appendRows_(sheet, rows2d) {\n  if (!rows2d || rows2d.length === 0) return;\n  sheet.getRange(sheet.getLastRow() + 1, 1, rows2d.length, rows2d[0].length).setValues(rows2d);\n}\n\nfunction loadExistingIdsFromColumn_(sheet, colIndex) {\n  const lastRow = sheet.getLastRow();\n  const set = new Set();\n  if (lastRow < 2) return set;\n\n  const vals = sheet.getRange(2, colIndex, lastRow - 1, 1).getValues();\n  for (const [v] of vals) {\n    const s = String(v ?? \"\").trim();\n    if (s) set.add(s);\n  }\n  return set;\n}",
+      "lastModifyUser": {
+        "domain": "bellmech.com",
+        "email": "blake@bellmech.com",
+        "name": "Blake Bennett",
+        "photoUrl": "https://lh3.googleusercontent.com/a/ACg8ocI4azoPqdnaq5N-wsG2B9uF-cVybOe6LZwpNAHKrecBvUw-9Q=h128"
+      },
+      "createTime": "2026-02-03T14:50:10.475Z",
+      "updateTime": "2026-03-25T15:48:37.446Z",
+      "functionSet": {
+        "values": [
+          {
+            "name": "hvacBizPro_ImportAndParse"
+          },
+          {
+            "name": "hvacBizPro_ImportRaw_",
+            "parameters": [
+              "shRaw"
+            ]
+          },
+          {
+            "name": "hvacBizPro_ParseAndAppendJobs_",
+            "parameters": [
+              "shRaw",
+              "shJobs"
+            ]
+          },
+          {
+            "name": "parseHvacBizProBody_",
+            "parameters": [
+              "body"
+            ]
+          },
+          {
+            "name": "rawHeaders_"
+          },
+          {
+            "name": "jobHeaders_"
+          },
+          {
+            "name": "toProperCase_",
+            "parameters": [
+              "str"
+            ]
+          },
+          {
+            "name": "fixRowToLength_",
+            "parameters": [
+              "row",
+              "len"
+            ]
+          },
+          {
+            "name": "findValueAfterLabel_",
+            "parameters": [
+              "l",
+              "k"
+            ]
+          },
+          {
+            "name": "pickValueAfterPercentFromLines_",
+            "parameters": [
+              "l",
+              "k"
+            ]
+          },
+          {
+            "name": "pickLastNumberFromLines_",
+            "parameters": [
+              "l",
+              "k"
+            ]
+          },
+          {
+            "name": "findLineStartsWith_",
+            "parameters": [
+              "l",
+              "k"
+            ]
+          },
+          {
+            "name": "findIndexStartsWith_",
+            "parameters": [
+              "l",
+              "k"
+            ]
+          },
+          {
+            "name": "parseCityStateZipLoose_",
+            "parameters": [
+              "l"
+            ]
+          },
+          {
+            "name": "extractProposalLink_",
+            "parameters": [
+              "b"
+            ]
+          },
+          {
+            "name": "normalizeBody_",
+            "parameters": [
+              "plain"
+            ]
+          },
+          {
+            "name": "logExec_",
+            "parameters": [
+              "tag",
+              "msg"
+            ]
+          },
+          {
+            "name": "getSpreadsheet_"
+          },
+          {
+            "name": "getOrCreateSheet_",
+            "parameters": [
+              "ss",
+              "name",
+              "headers2d"
+            ]
+          },
+          {
+            "name": "appendRows_",
+            "parameters": [
+              "sheet",
+              "rows2d"
+            ]
+          },
+          {
+            "name": "loadExistingIdsFromColumn_",
+            "parameters": [
+              "sheet",
+              "colIndex"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "Actual Costs",
+      "type": "SERVER_JS",
+      "source": "/**\n * Fast refresh using one batch write via Sheets Advanced Service.\n * Row 1 preserved. Writes A2:I in a single call. Clears tail implicitly.\n * DEST: \"Actual Costs\" tab in spreadsheet 1MnkDZSNcNR4RFiPE3-QfSVtEvZ_M_qS_KdRHGiFyAvY\n */\nfunction refreshMaterialCostImport() {\n  const DEST_FILE_ID = '1MnkDZSNcNR4RFiPE3-QfSVtEvZ_M_qS_KdRHGiFyAvY';\n  const DEST_SHEET_NAME = 'Material Cost Import';\n\n  const SOURCE_IDS = [\n    '1-HFrkzF3Mqf0WxZhoSXEArc_3ZSzWT6NB-XBjD0bl9Q',\n    '1OSdrTRwBv4ZRWbueTM7lPguID8d9OehFJkQEimNlstU',\n    '1_frrVtIqkfg5hVtglhHTNK8yIO7TnUO4liC8uW0pQAE',\n  ];\n  const KEEP_SET = new Set(['Equipment', 'Stock Equipment', 'Special Order']);\n\n  const t0 = Date.now();\n\n  // ---- Destination spreadsheet/sheet (NOT the active spreadsheet)\n  const destSS = SpreadsheetApp.openById(DEST_FILE_ID);\n  const dst =\n    destSS.getSheetByName(DEST_SHEET_NAME) || destSS.insertSheet(DEST_SHEET_NAME);\n\n  function safe(v) {\n    return v == null ? '' : v;\n  }\n\n  function fmtMDY(d) { // MM/DD/YYYY\n    const m = String(d.getMonth() + 1).padStart(2, '0');\n    const day = String(d.getDate()).padStart(2, '0');\n    const y = d.getFullYear();\n    return `${m}/${day}/${y}`;\n  }\n\n  function normalizeDatesInMatrix(rows) {\n    for (let r = 0; r < rows.length; r++) {\n      const row = rows[r];\n      for (let c = 0; c < row.length; c++) {\n        const v = row[c];\n        if (v instanceof Date && !isNaN(v)) row[c] = fmtMDY(v);\n      }\n    }\n    return rows;\n  }\n\n  function retry_(label, fn, tries = 4, baseMs = 300) {\n    let last;\n    for (let i = 0; i < tries; i++) {\n      try {\n        const t = Date.now();\n        const r = fn();\n        console.log(`[time] ${label} ${Date.now() - t}ms try${i + 1}/${tries}`);\n        return r;\n      } catch (e) {\n        last = e;\n        const wait = Math.min(baseMs * Math.pow(2, i), 5000);\n        console.log(`[retry] ${label} ${i + 1}/${tries} wait ${wait}ms`, String(e));\n        Utilities.sleep(wait);\n      }\n    }\n    throw last;\n  }\n\n  // ---- Build columns in memory (no writes yet)\n  const A = [], B = [], C = [], D = [], E = [], F = [], G = [], H = [], I = [];\n\n  SOURCE_IDS.forEach((id, idx) => {\n    const srcLabel = `src#${idx + 1}`;\n    const src = retry_(`${srcLabel}: openById`, () => SpreadsheetApp.openById(id));\n\n    // Released: B..Q → B,E,H,Q\n    retry_(`${srcLabel}: Released B..Q`, () => {\n      const sh = src.getSheetByName('Released'); if (!sh) return;\n      const last = sh.getLastRow(); if (last < 3) return;\n      const block = sh.getRange(3, 2, last - 2, 16).getValues();\n      block.forEach(r => {\n        I.push(safe(r[0]));   // B\n        B.push(safe(r[3]));   // E\n        A.push(safe(r[6]));   // H\n        C.push(safe(r[15]));  // Q\n      });\n    });\n\n    // Received: B..U → B,E,H,T,U\n    retry_(`${srcLabel}: Received B..U`, () => {\n      const sh = src.getSheetByName('Received'); if (!sh) return;\n      const last = sh.getLastRow(); if (last < 3) return;\n      const block = sh.getRange(3, 2, last - 2, 20).getValues();\n      block.forEach(r => {\n        const b = safe(r[0]);            // B\n        const cat = String(safe(r[3]));  // E\n        const h = safe(r[6]);            // H\n        const t = safe(r[18]);           // T\n        const u = safe(r[19]);           // U\n        F.push(h);\n        G.push(t);\n        if (KEEP_SET.has(cat)) {\n          D.push(h);\n          E.push(u);\n          H.push(b);\n        } else {\n          D.push('');\n          E.push('');\n          H.push('');\n        }\n      });\n    });\n  });\n\n  // ---- Assemble one rectangular matrix A2:I and write once\n  const prevLast = dst.getLastRow(); // includes header\n  const newHeights = [A.length, B.length, C.length, D.length, E.length, F.length, G.length, H.length, I.length];\n  const newMax = Math.max(...newHeights);\n  const prevHeight = Math.max(0, prevLast - 1);\n  const height = Math.max(newMax, prevHeight);\n\n  const rows2D = new Array(height);\n  for (let r = 0; r < height; r++) {\n    rows2D[r] = [\n      A[r] ?? '', B[r] ?? '', C[r] ?? '',\n      D[r] ?? '', E[r] ?? '', F[r] ?? '',\n      G[r] ?? '', H[r] ?? '', I[r] ?? ''\n    ];\n  }\n\n  // Force MM/DD/YYYY for any Date cells\n  normalizeDatesInMatrix(rows2D);\n\n  // Single call via Advanced Service. Overwrites A2:I(1+height) in one request.\n  const range = `'${DEST_SHEET_NAME}'!A2:I${height + 1}`;\n  retry_('values.update A2:I', () =>\n    Sheets.Spreadsheets.Values.update(\n      { range, majorDimension: 'ROWS', values: rows2D },\n      DEST_FILE_ID,\n      range,\n      { valueInputOption: 'RAW' }\n    ),\n    3, 400\n  );\n\n  const totalMillis = Date.now() - t0;\n  console.log(`[summary] totalMillis: ${totalMillis}, rows: ${height}`);\n}\n",
+      "lastModifyUser": {
+        "domain": "bellmech.com",
+        "email": "blake@bellmech.com",
+        "name": "Blake Bennett",
+        "photoUrl": "https://lh3.googleusercontent.com/a/ACg8ocI4azoPqdnaq5N-wsG2B9uF-cVybOe6LZwpNAHKrecBvUw-9Q=h128"
+      },
+      "createTime": "2026-02-02T18:52:18.887Z",
+      "updateTime": "2026-03-25T15:48:37.446Z",
+      "functionSet": {
+        "values": [
+          {
+            "name": "refreshMaterialCostImport"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Manday Calculator Port",
+      "type": "SERVER_JS",
+      "source": "function QuickMode() {\n  // Step 4: Generate the manday map\n  const mandayMap = generateMandayMap();\n  SpreadsheetApp.getActive().toast('Step 4 Completed: Manday map generated.', 'Step 4 of 5', 3);\n\n  // Step 5: Search for IDs and calculate mandays\n  calculateMandaysForIDs(mandayMap);\n  SpreadsheetApp.getActive().toast('Step 5 Completed: Mandays calculated for all Pipedrive IDs.', 'Step 5 of 5', 3);\n\n  // Notify completion\n  Logger.log('Manday calculation process completed.');\n  SpreadsheetApp.getActive().toast('Manday calculation process completed.', 'Done', 5);\n}\n\nfunction MandayRecalculation() {\n  // Step 1: Clear the 'Week Key' sheet\n  clearWeekKeySheet();\n  SpreadsheetApp.getActive().toast('Step 1 Completed: Week Key sheet cleared.', 'Step 1 of 5', 3);\n\n  // Step 2: Copy only grey cells from 'Formula Friendly Schedule' to 'Week Key'\n  copyGreyCellsToWeekKey();\n  SpreadsheetApp.getActive().toast('Step 2 Completed: Grey cells copied to Week Key sheet.', 'Step 2 of 5', 3);\n\n  // Step 3: Replace tech names with manday values in 'Week Key'\n  replaceTechNamesWithMandayValues();\n  SpreadsheetApp.getActive().toast('Step 3 Completed: Tech names replaced with manday values.', 'Step 3 of 5', 3);\n\n  // Step 4: Generate the manday map\n  const mandayMap = generateMandayMap();\n  SpreadsheetApp.getActive().toast('Step 4 Completed: Manday map generated.', 'Step 4 of 5', 3);\n\n  // Step 5: Search for IDs and calculate mandays\n  calculateMandaysForIDs(mandayMap);\n  SpreadsheetApp.getActive().toast('Step 5 Completed: Mandays calculated for all Pipedrive IDs.', 'Step 5 of 5', 3);\n\n  // Notify completion\n  Logger.log('Manday calculation process completed.');\n  SpreadsheetApp.getActive().toast('Manday calculation process completed.', 'Done', 5);\n}\n\nfunction clearWeekKeySheet() {\n  const ss = SpreadsheetApp.getActiveSpreadsheet();\n  const weekKeySheet = ss.getSheetByName('Week Key');\n  if (!weekKeySheet) {\n    Logger.log('Error: Week Key sheet is missing.');\n    return;\n  }\n  weekKeySheet.clearContents();\n  Logger.log('Week Key sheet has been cleared.');\n}\n\nfunction copyGreyCellsToWeekKey() {\n  const ss = SpreadsheetApp.getActiveSpreadsheet();\n  const formulaSheet = ss.getSheetByName('Formula Friendly Schedule');\n  const weekKeySheet = ss.getSheetByName('Week Key');\n  if (!formulaSheet || !weekKeySheet) {\n    Logger.log('Error: One or more required sheets are missing.');\n    return;\n  }\n\n  const lastRow = formulaSheet.getLastRow();\n  const lastCol = formulaSheet.getLastColumn();\n\n  const dataRange = formulaSheet.getRange(1, 1, lastRow, lastCol);\n  const dataValues = dataRange.getValues();\n  const bgColors = dataRange.getBackgrounds();\n\n  const greyCellValues = dataValues.map(row => row.map(() => ''));\n\n  const knownGreyCell = formulaSheet.getRange('A4');\n  const greyColorCode = knownGreyCell.getBackground();\n\n  // Explicitly skip rows 2 and 3 (index 1 and 2)\n  for (let i = 0; i < dataValues.length; i++) {\n    if (i === 1 || i === 2) continue; // skip rows 2 & 3 outright\n    for (let j = 0; j < dataValues[0].length; j++) {\n      if (bgColors[i][j] === greyColorCode) {\n        greyCellValues[i][j] = dataValues[i][j].toString();\n      }\n    }\n  }\n\n  weekKeySheet.getRange(1, 1, greyCellValues.length, lastCol).setValues(greyCellValues);\n  Logger.log('Grey cells copied to Week Key sheet (rows 2 and 3 skipped).');\n}\n\nfunction replaceTechNamesWithMandayValues() {\n  const ss = SpreadsheetApp.getActiveSpreadsheet();\n  const weekKeySheet = ss.getSheetByName('Week Key');\n  const techListSheet = ss.getSheetByName('TechList');\n  const formulaSheet = ss.getSheetByName('Formula Friendly Schedule');\n\n  if (!weekKeySheet || !techListSheet || !formulaSheet) {\n    Logger.log('Error: One or more required sheets are missing.');\n    return;\n  }\n\n  // ---- helper: \"Week - 48 (2025)\" -> 2025*100 + 48\n  function weekOrdinal(label) {\n    if (!label) return NaN;\n    const s = String(label).trim();\n    const m = s.match(/^Week\\s*-\\s*(\\d{1,2})\\s*\\((\\d{4})\\)$/i);\n    if (!m) return NaN;\n    const w = parseInt(m[1], 10);\n    const y = parseInt(m[2], 10);\n    return (isNaN(w) || isNaN(y)) ? NaN : y * 100 + w;\n  }\n\n  // ======================\n  // 1) TechList: build per-tech series from A4:A and B4:P\n  // ======================\n\n  // Use last row based on column A (names), not whole sheet.\n  const lastTechRow = techListSheet.getRange('A:A').getLastRow();\n  const techRowCount = Math.max(0, lastTechRow - 3); // rows 4+\n\n  if (techRowCount === 0) {\n    Logger.log('No tech rows found in TechList (A4:A is empty).');\n  }\n\n  const headerWeeksRaw = techListSheet.getRange('B2:P2').getValues()[0];\n  const headerWeeks = headerWeeksRaw.map(v => v ? String(v).trim() : '');\n  const headerKeys = headerWeeks.map(weekOrdinal);\n\n  const techNames = techRowCount\n    ? techListSheet.getRange(4, 1, techRowCount, 1).getValues().flat()\n    : [];\n  const techValues = techRowCount\n    ? techListSheet.getRange(4, 2, techRowCount, 16).getValues() // B..P\n    : [];\n\n  const techSeries = {};\n  for (let r = 0; r < techRowCount; r++) {\n    const nameNorm = String(techNames[r] || '').trim().toLowerCase();\n    if (!nameNorm) continue;\n\n    const rowVals = techValues[r].slice();\n    // left-fill: each new value applies at that week and all weeks after\n    let lastSeen = null;\n    for (let c = 0; c < rowVals.length; c++) {\n      const v = rowVals[c];\n      if (v === '' || v == null) {\n        rowVals[c] = lastSeen;\n      } else {\n        lastSeen = v;\n      }\n    }\n    techSeries[nameNorm] = rowVals;\n  }\n\n  function getTechValueForWeek(techNameNorm, weekLabel) {\n    const series = techSeries[techNameNorm];\n    if (!series) return 0.5;\n\n    const targetKey = weekOrdinal(weekLabel);\n    if (isNaN(targetKey)) return 0.5;\n\n    // last header <= target\n    let idx = -1;\n    for (let i = 0; i < headerKeys.length; i++) {\n      const k = headerKeys[i];\n      if (!isNaN(k) && k <= targetKey) idx = i;\n    }\n    if (idx === -1) idx = 0;\n\n    const num = Number(series[idx]);\n    return isNaN(num) ? 0.5 : num;\n  }\n\n  // ======================\n  // 2) Read Week Key + week labels with limited width\n  // ======================\n  const wkLastRow = weekKeySheet.getLastRow();\n  if (wkLastRow < 2) {\n    Logger.log('Week Key has no data to convert.');\n    return;\n  }\n\n  const schedLastCol = formulaSheet.getLastColumn(); // authoritative width\n  if (schedLastCol < 1) {\n    Logger.log('Formula Friendly Schedule has no columns.');\n    return;\n  }\n\n  // Week labels from Week Key row 1 (should be \"Week - 48 (2025)\" etc.)\n  const headerRow = weekKeySheet.getRange(1, 1, 1, schedLastCol).getValues()[0];\n  const weekLabels = headerRow.map(v => v ? String(v).trim() : '');\n\n  // Tech names / values currently in Week Key (rows 2..end, cols 1..schedLastCol)\n  const bodyValues = weekKeySheet.getRange(2, 1, wkLastRow - 1, schedLastCol).getValues();\n\n  // Prepare output values: same size as existing Week Key (wkLastRow x schedLastCol)\n  const outValues = new Array(wkLastRow);\n  // row 1: keep week labels as-is\n  outValues[0] = weekLabels.slice();\n\n  // rows 2+: insert numeric values\n  for (let r = 0; r < bodyValues.length; r++) {\n    const rowOut = new Array(schedLastCol);\n    const rowIn = bodyValues[r];\n    for (let c = 0; c < schedLastCol; c++) {\n      const raw = rowIn[c];\n\n      // Empty stays empty\n      if (raw === '' || raw == null) {\n        rowOut[c] = '';\n        continue;\n      }\n\n      // If already numeric (Week Key already converted), keep it. Don't re-map to 0.5.\n      if (typeof raw === 'number') {\n        rowOut[c] = raw;\n        continue;\n      }\n\n      // Text: treat as tech name and map through TechList\n      const techName = String(raw).trim();\n      const norm = techName.toLowerCase();\n      const weekLabel = weekLabels[c];\n      const value = getTechValueForWeek(norm, weekLabel);\n\n      rowOut[c] = value;\n\n      if (value === 0.5 && !techSeries[norm]) {\n        Logger.log(`Unrecognized tech \"${techName}\" at Week Key r${r + 2}, week \"${weekLabel}\". Assigned 0.5`);\n      }\n    }\n    outValues[r + 1] = rowOut;\n  }\n\n  // ======================\n  // 3) Write back once (no notes, no extra columns)\n  // ======================\n  const writeRange = weekKeySheet.getRange(1, 1, wkLastRow, schedLastCol);\n  writeRange.clearContent(); // keep formats\n  writeRange.setValues(outValues);\n\n  Logger.log('Week Key updated: single column per week, numeric manday values only.');\n}\n\nfunction generateMandayMap() {\n  const ss = SpreadsheetApp.getActiveSpreadsheet();\n  const weekKeySheet = ss.getSheetByName('Week Key');\n  if (!weekKeySheet) {\n    Logger.log('Error: Week Key sheet is missing.');\n    return {};\n  }\n\n  const lastRow = weekKeySheet.getLastRow();\n  const lastCol = weekKeySheet.getLastColumn();\n\n  const weekLabelsRaw = weekKeySheet.getRange(1, 1, 1, lastCol).getValues()[0];\n  const weekLabels = weekLabelsRaw.map(label => label ? label.toString().trim() : '');\n\n  const mandayMap = {};\n  for (let j = 0; j < weekLabels.length; j++) {\n    const weekLabel = weekLabels[j];\n    if (!weekLabel) continue;\n    mandayMap[weekLabel] = [];\n\n    for (let i = 1; i < Math.min(75, lastRow); i++) {\n      let cellValue = weekKeySheet.getRange(i + 1, j + 1).getValue();\n      if (cellValue === '' || cellValue == null) {\n        cellValue = 0.5;\n      } else {\n        cellValue = Number(cellValue);\n      }\n      mandayMap[weekLabel].push(cellValue);\n    }\n    Logger.log(`Week Key \"${weekLabel}\": Values from rows 2-75: ${mandayMap[weekLabel].join(', ')}`);\n  }\n\n  Logger.log('Manday map generated successfully.');\n  return mandayMap;\n}\n\nfunction calculateMandaysForIDs(mandayMap) {\n  const ss = SpreadsheetApp.getActiveSpreadsheet();\n  const formulaSheet = ss.getSheetByName('Formula Friendly Schedule');\n  const jobTracking = ss.getSheetByName('Job Tracking');\n  const techListSheet = ss.getSheetByName('TechList');\n\n  if (!formulaSheet || !jobTracking || !techListSheet) {\n    Logger.log('Error: Required sheet(s) missing.');\n    return;\n  }\n\n  // Job Tracking columns:\n  // A = Job Name\n  // B = Pipedrive ID\n  // F = Status\n  // G = Start Date\n  // H = Completed Date\n  // P = Actual Mandays (output)\n  const JT_COL_ID = 2;         // B\n  const JT_COL_STATUS = 6;     // F\n  const JT_COL_START = 7;      // G\n  const JT_COL_COMPLETED = 8;  // H\n  const JT_COL_MANDAYS = 16;   // O (output + existing mandays for skip)\n\n  const jtLastRow = jobTracking.getLastRow();\n  if (jtLastRow < 2) {\n    Logger.log('Job Tracking has no data rows.');\n    return;\n  }\n\n  // Read A:L so we have id/status/dates/mandays\n  const jtData = jobTracking.getRange(2, 1, jtLastRow - 1, JT_COL_MANDAYS).getValues();\n  const idInfo = [];\n\n  jtData.forEach((row, idx) => {\n    const id = row[JT_COL_ID - 1]; // B\n    const status = row[JT_COL_STATUS - 1]; // F\n    const startDateRaw = row[JT_COL_START - 1]; // G\n    const completedRaw = row[JT_COL_COMPLETED - 1]; // H\n    const existingMandays = row[JT_COL_MANDAYS - 1]; // L\n\n    if (id && id.toString().trim() !== '') {\n      idInfo.push({\n        id: id.toString().trim(),\n        startDateRaw,\n        status,\n        completedRaw,\n        existingMandays,\n        rowNumber: idx + 2, // because jtData starts at row 2\n      });\n    }\n  });\n\n  // \"Today\" from TechList!R1 (existing behavior)\n  const today = techListSheet.getRange('R1').getValue();\n  if (!(today instanceof Date)) {\n    Logger.log('Error: Invalid date in TechList!R1.');\n    return;\n  }\n\n  // Cutoff for future weeks (existing logic)\n  const cutoffDate = new Date(today);\n  cutoffDate.setMonth(cutoffDate.getMonth() + 2);\n\n  // Two-week lookback for skipping completed jobs\n  const twoWeeksAgo = new Date(today);\n  twoWeeksAgo.setDate(twoWeeksAgo.getDate() - 14);\n\n  const lastRow = formulaSheet.getLastRow();\n  const lastCol = formulaSheet.getLastColumn();\n  const scheduleData = formulaSheet.getRange(1, 1, lastRow, lastCol).getValues();\n  const weekLabels = scheduleData[0].map(label => label ? label.toString().trim() : '');\n  const dateRow = scheduleData[2];\n\n  // Precompute cell A1 notations for logging\n  const cellNotations = [];\n  for (let row = 1; row < Math.min(75, scheduleData.length); row++) {\n    cellNotations[row] = [];\n    for (let col = 0; col < weekLabels.length; col++) {\n      cellNotations[row][col] = formulaSheet.getRange(row + 1, col + 1).getA1Notation();\n    }\n  }\n\n  const checkedCellsLog = [];\n\n  idInfo.forEach(({ id, startDateRaw, status, completedRaw, existingMandays, rowNumber }) => {\n    // Skip rule: Completed, completed > 2 weeks ago, and already has mandays > 0\n    let skip = false;\n    let completedDate = null;\n\n    if (completedRaw instanceof Date && !isNaN(completedRaw)) {\n      completedDate = completedRaw;\n    } else if (completedRaw) {\n      const tmp = new Date(completedRaw);\n      if (!isNaN(tmp)) completedDate = tmp;\n    }\n\n    if (\n      status === 'Completed' &&\n      completedDate &&\n      completedDate <= twoWeeksAgo &&\n      Number(existingMandays) > 0\n    ) {\n      skip = true;\n    }\n\n    if (skip) {\n      Logger.log(`Skipping ID ${id} at row ${rowNumber}: Completed, older than 2 weeks, mandays already set (${existingMandays}).`);\n      return;\n    }\n\n    // Normal manday calculation for non-skipped rows\n    if (!startDateRaw) {\n      Logger.log(`Start date missing for ID ${id} at row ${rowNumber}`);\n      return;\n    }\n\n    const startDate = new Date(startDateRaw);\n    if (isNaN(startDate.getTime())) {\n      Logger.log(`Invalid start date for ID ${id} at row ${rowNumber}`);\n      return;\n    }\n\n    let totalMandays = 0;\n    const idVariants = getIdVariants(id);\n\n    for (let col = 0; col < weekLabels.length; col++) {\n      const weekLabel = weekLabels[col];\n      const weekDate = dateRow[col];\n\n      if (!weekLabel || !weekDate || isNaN(new Date(weekDate))) continue;\n\n      const currentWeekDate = new Date(weekDate);\n\n      if (currentWeekDate >= startDate && currentWeekDate <= cutoffDate) {\n        for (let row = 1; row < Math.min(75, scheduleData.length); row++) {\n          const cellValue = scheduleData[row][col];\n          if (cellValue) {\n            const cellText = cellValue.toString().trim();\n            const match = idVariants.some(variant =>\n              new RegExp(`\\\\b${variant}\\\\b`, 'i').test(cellText)\n            );\n\n            if (match) {\n              const mandayRowIndex = row - 1;\n              const mandayValue = (mandayMap[weekLabel] && mandayMap[weekLabel][mandayRowIndex])\n                ? mandayMap[weekLabel][mandayRowIndex]\n                : 0.5;\n              totalMandays += Number(mandayValue);\n              checkedCellsLog.push([id, 'Formula Friendly Schedule', cellNotations[row][col], weekLabel, cellValue]);\n            }\n          }\n        }\n      }\n    }\n\n    // Write mandays to Job Tracking column L\n    jobTracking.getRange(rowNumber, JT_COL_MANDAYS).setValue(totalMandays);\n    Logger.log(`Mandays for ID ${id} (row ${rowNumber}): ${totalMandays}`);\n    SpreadsheetApp.getActive().toast(`ID ${id} calculated: ${totalMandays} mandays`, 'Manday Calculation', 5);\n  });\n\n  logCheckedCells(checkedCellsLog);\n}\n\nfunction getIdVariants(id) {\n  const idStr = id.toString().trim();\n  return idStr.includes('/') ? idStr.split('/').map(s => s.trim()) : [idStr];\n}\n\nfunction logCheckedCells(logData) {\n  const ss = SpreadsheetApp.getActiveSpreadsheet();\n  let logSheet = ss.getSheetByName('CheckedLog');\n\n  if (!logSheet) {\n    logSheet = ss.insertSheet('CheckedLog');\n  } else {\n    logSheet.clearContents();\n  }\n\n  const headers = [['ID', 'Sheet', 'Cell', 'Week Label', 'Checked Value']];\n  const outputData = headers.concat(logData);\n\n  logSheet.getRange(1, 1, outputData.length, outputData[0].length).setValues(outputData);\n  Logger.log('CheckedLog sheet updated.');\n}\n",
+      "lastModifyUser": {
+        "domain": "bellmech.com",
+        "email": "blake@bellmech.com",
+        "name": "Blake Bennett",
+        "photoUrl": "https://lh3.googleusercontent.com/a/ACg8ocI4azoPqdnaq5N-wsG2B9uF-cVybOe6LZwpNAHKrecBvUw-9Q=h128"
+      },
+      "createTime": "2026-02-02T19:49:40.932Z",
+      "updateTime": "2026-03-25T15:48:37.446Z",
+      "functionSet": {
+        "values": [
+          {
+            "name": "QuickMode"
+          },
+          {
+            "name": "MandayRecalculation"
+          },
+          {
+            "name": "clearWeekKeySheet"
+          },
+          {
+            "name": "copyGreyCellsToWeekKey"
+          },
+          {
+            "name": "replaceTechNamesWithMandayValues"
+          },
+          {
+            "name": "generateMandayMap"
+          },
+          {
+            "name": "calculateMandaysForIDs",
+            "parameters": [
+              "mandayMap"
+            ]
+          },
+          {
+            "name": "getIdVariants",
+            "parameters": [
+              "id"
+            ]
+          },
+          {
+            "name": "logCheckedCells",
+            "parameters": [
+              "logData"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "New Deal Detector",
+      "type": "SERVER_JS",
+      "source": "/**\n * DEPOSIT RECEIVED (Gmail) -> Job Tracking (Google Sheet)\n *\n * FIX: write to the FIRST SAFE BLANK ROW (not \"lastRow+1\")\n * Safe row rule:\n * - If column A is blank OR column B is blank, that row is considered writable.\n *\n * Writes:\n * - Col A = Job Name\n * - Col B = Pipedrive ID\n *\n * Skip:\n * - If ID already exists anywhere in column B, skip it.\n */\n\nconst TARGET_SPREADSHEET_ID = \"1MnkDZSNcNR4RFiPE3-QfSVtEvZ_M_qS_KdRHGiFyAvY\";\nconst TARGET_SHEET_NAME = \"Job Tracking\";\n\nconst DAYS_LOOKBACK = 180;\nconst GMAIL_QUERY_BASE = 'from:me subject:\"Deposit Received\"';\n\nconst THREAD_PAGE_SIZE = 100;\nconst MAX_PAGES = 25;\n\nfunction logNewDealsFromEmail() {\n  logExec_(\"RUN_START\", \"Deposit Received -> Job Tracking\");\n\n  const ss = SpreadsheetApp.openById(TARGET_SPREADSHEET_ID);\n  const sh = ss.getSheetByName(TARGET_SHEET_NAME);\n  if (!sh) throw new Error(`Sheet not found: ${TARGET_SHEET_NAME}`);\n\n  const maxRows = sh.getMaxRows();\n  const dataAB = sh.getRange(2, 1, maxRows - 1, 2).getValues(); // A2:B\n\n  // Existing IDs set + first safe writable row\n  const existingIds = new Set();\n  let firstWritableIndex = -1; // index into dataAB (0-based), row = index+2\n\n  for (let i = 0; i < dataAB.length; i++) {\n    const aVal = String(dataAB[i][0] ?? \"\").trim();\n    const bVal = String(dataAB[i][1] ?? \"\").trim();\n\n    if (bVal) existingIds.add(bVal);\n\n    // SAFE ROW: if A blank OR B blank, it is writable\n    if (firstWritableIndex === -1 && (!aVal || !bVal)) {\n      firstWritableIndex = i;\n    }\n  }\n\n  logExec_(\"EXISTING_IDS\", `Count=${existingIds.size}`);\n  logExec_(\"FIRST_WRITABLE_ROW\", firstWritableIndex === -1 ? \"NONE\" : String(firstWritableIndex + 2));\n\n  if (firstWritableIndex === -1) {\n    throw new Error(\"No writable rows found (A blank OR B blank). Add more rows or clear gaps.\");\n  }\n\n  const gmailQuery = `${GMAIL_QUERY_BASE} newer_than:${DAYS_LOOKBACK}d`;\n  logExec_(\"GMAIL_QUERY\", gmailQuery);\n\n  let totalThreads = 0;\n  let inspected = 0;\n  let skippedNoId = 0;\n  let skippedNoName = 0;\n  let skippedDup = 0;\n\n  const newRows = []; // [jobName, id]\n\n  for (let page = 0; page < MAX_PAGES; page++) {\n    const start = page * THREAD_PAGE_SIZE;\n    const threads = GmailApp.search(gmailQuery, start, THREAD_PAGE_SIZE);\n\n    logExec_(\"THREAD_PAGE\", `page=${page + 1} fetched=${threads.length} start=${start}`);\n    if (!threads.length) break;\n\n    totalThreads += threads.length;\n\n    for (const thread of threads) {\n      for (const msg of thread.getMessages()) {\n        inspected++;\n\n        const body = msg.getPlainBody() || \"\";\n        const jobNameRaw = extractDepositName_(body);\n        const idStr = extractDepositPipedriveId_(body);\n\n        if (!idStr) {\n          skippedNoId++;\n          continue;\n        }\n\n        const jobName = toProperCase_(jobNameRaw);\n        if (!jobName) {\n          skippedNoName++;\n          continue;\n        }\n\n        if (existingIds.has(idStr)) {\n          skippedDup++;\n          continue;\n        }\n\n        existingIds.add(idStr);\n        newRows.push([jobName, idStr]);\n        logExec_(\"QUEUED\", `${idStr} | ${jobName}`);\n      }\n    }\n  }\n\n  logExec_(\"SUMMARY\", `Threads=${totalThreads} Messages=${inspected} New=${newRows.length} NoID=${skippedNoId} NoName=${skippedNoName} Dup=${skippedDup}`);\n\n  if (!newRows.length) {\n    logExec_(\"RUN_END\", \"Nothing to write\");\n    return;\n  }\n\n  // Write sequentially into the first writable row, filling downward.\n  // (Assumes you want to fill the table top-down without skipping gaps.)\n  const startRow = firstWritableIndex + 2;\n  const endRow = startRow + newRows.length - 1;\n\n  if (endRow > sh.getMaxRows()) {\n    throw new Error(`Not enough rows to write. Need rows ${startRow}..${endRow}, maxRows=${sh.getMaxRows()}`);\n  }\n\n  sh.getRange(startRow, 1, newRows.length, 2).setValues(newRows);\n\n  logExec_(\"WROTE\", `Rows=${newRows.length} startRow=${startRow}`);\n  logExec_(\"RUN_END\", \"Done\");\n}\n\n/* =========================\n * Parsing helpers\n * ========================= */\n\nfunction extractDepositName_(body) {\n  if (!body) return \"\";\n  const lines = body.split(/\\r?\\n/).map(l => l.trim());\n\n  for (let i = 0; i < lines.length; i++) {\n    const l = lines[i];\n\n    // Same-line: \"Deposit has been received for: JOB NAME\"\n    let m = l.match(/^Deposit has been received for\\s*:\\s*(.+)$/i);\n    if (m && m[1]) return m[1].trim();\n\n    // Next-line:\n    if (/^Deposit has been received for\\s*:\\s*$/i.test(l)) {\n      for (let j = i + 1; j < lines.length; j++) {\n        if (lines[j]) return lines[j];\n      }\n      return \"\";\n    }\n  }\n  return \"\";\n}\n\nfunction extractDepositPipedriveId_(body) {\n  if (!body) return \"\";\n\n  // Inline match\n  let m = body.match(/Pipedrive ID\\s*:\\s*\\(?\\s*(\\d+)\\s*\\)?/i);\n  if (m) return String(m[1]).trim();\n\n  // Next-line match\n  const lines = body.split(/\\r?\\n/).map(l => l.trim());\n  for (let i = 0; i < lines.length; i++) {\n    if (/^Pipedrive ID\\s*:\\s*$/i.test(lines[i])) {\n      for (let j = i + 1; j < Math.min(lines.length, i + 5); j++) {\n        const mm = lines[j].match(/\\(?\\s*(\\d+)\\s*\\)?/);\n        if (mm) return String(mm[1]).trim();\n      }\n    }\n  }\n\n  return \"\";\n}\n\n/* =========================\n * Formatting + logging\n * ========================= */\n\nfunction toProperCase_(str) {\n  if (!str) return \"\";\n  return String(str)\n    .trim()\n    .toLowerCase()\n    .split(/\\s+/)\n    .map(w => (w ? w[0].toUpperCase() + w.slice(1) : \"\"))\n    .join(\" \");\n}\n\nfunction logExec_(tag, msg) {\n  const line = `${new Date().toISOString()} | ${tag} | ${msg}`;\n  Logger.log(line);\n  console.log(line);\n}\n",
+      "lastModifyUser": {
+        "domain": "bellmech.com",
+        "email": "blake@bellmech.com",
+        "name": "Blake Bennett",
+        "photoUrl": "https://lh3.googleusercontent.com/a/ACg8ocI4azoPqdnaq5N-wsG2B9uF-cVybOe6LZwpNAHKrecBvUw-9Q=h128"
+      },
+      "createTime": "2026-02-02T20:00:43.473Z",
+      "updateTime": "2026-03-25T15:48:37.446Z",
+      "functionSet": {
+        "values": [
+          {
+            "name": "logNewDealsFromEmail"
+          },
+          {
+            "name": "extractDepositName_",
+            "parameters": [
+              "body"
+            ]
+          },
+          {
+            "name": "extractDepositPipedriveId_",
+            "parameters": [
+              "body"
+            ]
+          },
+          {
+            "name": "toProperCase_",
+            "parameters": [
+              "str"
+            ]
+          },
+          {
+            "name": "logExec_",
+            "parameters": [
+              "tag",
+              "msg"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "Start & End Dates",
+      "type": "SERVER_JS",
+      "source": "function findFirstAndLastAppearanceDates() {\n  const ss = SpreadsheetApp.getActiveSpreadsheet();\n  const formulaSheet = ss.getSheetByName('Formula Friendly Schedule');\n  const jobTracking = ss.getSheetByName('Job Tracking');\n\n  if (!formulaSheet || !jobTracking) {\n    Logger.log('Missing sheet.');\n    return;\n  }\n\n  const scheduleData = formulaSheet.getDataRange().getValues();\n  const dateRow = scheduleData[2]; // row 3 (0-based index 2)\n  const scheduleCols = scheduleData[0].length;\n\n  // IDs from Job Tracking column B\n  const ids = jobTracking.getRange('B2:B').getValues().map(r => r[0]);\n\n  const output = []; // [firstDate, lastDate]\n\n  ids.forEach(rawId => {\n    const id = rawId ? rawId.toString().trim() : '';\n    if (!id) {\n      output.push(['', '']);\n      return;\n    }\n\n    const idVariants = getIdVariants(id);\n\n    let firstDate = null;\n    let lastDate = null;\n\n    for (let col = 0; col < scheduleCols; col++) {\n      let foundInThisCol = false;\n\n      for (let row = 1; row < Math.min(75, scheduleData.length); row++) {\n        const cellVal = scheduleData[row][col];\n        if (!cellVal) continue;\n\n        const cellText = cellVal.toString().trim();\n        if (idVariants.some(v => new RegExp(`\\\\b${escapeRegex_(v)}\\\\b`, 'i').test(cellText))) {\n          foundInThisCol = true;\n          break;\n        }\n      }\n\n      if (foundInThisCol) {\n        const date = dateRow[col];\n        if (date instanceof Date) {\n          if (!firstDate) firstDate = date;\n          lastDate = date; // keep updating, so it ends as the last found\n        }\n      }\n    }\n\n    output.push([firstDate || '', lastDate || '']);\n  });\n\n  // Write to Job Tracking: C = first, D = last (starting row 2)\n  jobTracking.getRange(2, 3, output.length, 2).setValues(output);\n  Logger.log('First (C) and last (D) appearance dates written.');\n}\n\n/**\n * Escapes regex special chars for safe RegExp building.\n */\nfunction escapeRegex_(s) {\n  return String(s).replace(/[.*+?^${}()|[\\]\\\\]/g, '\\\\$&');\n}\n",
+      "lastModifyUser": {
+        "domain": "bellmech.com",
+        "email": "blake@bellmech.com",
+        "name": "Blake Bennett",
+        "photoUrl": "https://lh3.googleusercontent.com/a/ACg8ocI4azoPqdnaq5N-wsG2B9uF-cVybOe6LZwpNAHKrecBvUw-9Q=h128"
+      },
+      "createTime": "2026-02-03T12:44:19.433Z",
+      "updateTime": "2026-03-25T15:48:37.446Z",
+      "functionSet": {
+        "values": [
+          {
+            "name": "findFirstAndLastAppearanceDates"
+          },
+          {
+            "name": "escapeRegex_",
+            "parameters": [
+              "s"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "Material List Finder",
+      "type": "SERVER_JS",
+      "source": "/**\n * Material List Link Finder\n *\n * Reads:\n * - Sheet: \"Job Tracking\"\n * - ID column: B\n * - Company column: D  (used to pick root folder)\n *\n * Writes:\n * - Link column: Y\n *\n * Behavior:\n * - Scans upward starting from the LAST non-empty ID in column B\n * - Only processes rows where Y is blank OR \"No list found\" OR \"No List Created\"\n * - If runtime is near limit, saves progress and exits\n * - Next run resumes from the last row processed (continues scanning upward)\n */\n\nconst ML_CONFIG = {\n  SHEET: 'Job Tracking',\n  COL_ID: 2,        // B\n  COL_COMPANY: 4,   // D\n  COL_LINK: 25,     // Y\n  START_ROW: 2,\n\n  // Progress persistence\n  PROP_KEY_ROW: 'ML_LAST_ROW',\n\n  // Time budget\n  MAX_RUNTIME_MS: 5.5 * 60 * 1000, // stop before Apps Script hard limit\n};\n\nfunction populateMaterialListLinks_JobTracking() {\n  const t0 = Date.now();\n  Logger.log('populateMaterialListLinks_JobTracking() start');\n\n  const ss = SpreadsheetApp.getActiveSpreadsheet();\n  const sheet = ss.getSheetByName(ML_CONFIG.SHEET);\n  if (!sheet) {\n    Logger.log(`ERROR: Missing \"${ML_CONFIG.SHEET}\" sheet`);\n    return;\n  }\n\n  const lastRowById = findLastNonEmptyRowInColumn_(sheet, ML_CONFIG.COL_ID, ML_CONFIG.START_ROW);\n  if (lastRowById < ML_CONFIG.START_ROW) {\n    Logger.log('No IDs found in column B.');\n    return;\n  }\n\n  // Resume row: if stored row is invalid/outside current range, reset to lastRowById\n  const props = PropertiesService.getScriptProperties();\n  let resumeRow = Number(props.getProperty(ML_CONFIG.PROP_KEY_ROW) || '');\n  if (!resumeRow || resumeRow > lastRowById || resumeRow < ML_CONFIG.START_ROW) {\n    resumeRow = lastRowById;\n  }\n\n  Logger.log(`Last non-empty ID row in B: ${lastRowById}`);\n  Logger.log(`Starting scan at row: ${resumeRow} (upward)`);\n\n  let processed = 0;\n  let updated = 0;\n\n  for (let r = resumeRow; r >= ML_CONFIG.START_ROW; r--) {\n    // Time guard\n    if (Date.now() - t0 > ML_CONFIG.MAX_RUNTIME_MS) {\n      props.setProperty(ML_CONFIG.PROP_KEY_ROW, String(r));\n      Logger.log(`TIME_GUARD: saving resume row ${r} and exiting`);\n      Logger.log(`Processed=${processed} Updated=${updated}`);\n      return;\n    }\n\n    const id = sheet.getRange(r, ML_CONFIG.COL_ID).getDisplayValue().toString().trim();\n    if (!id) continue; // skip blanks in the ID column\n\n    const linkVal = sheet.getRange(r, ML_CONFIG.COL_LINK).getDisplayValue().toString().trim();\n\n    // Only process blanks or no-list markers\n    if (!(linkVal === '' || /^(no\\s+list\\s+found|no\\s+list\\s+created)$/i.test(linkVal))) {\n      continue;\n    }\n\n    const companyRaw = sheet.getRange(r, ML_CONFIG.COL_COMPANY).getDisplayValue().toString().trim();\n    const folderName = getFolderNameForCompany_(companyRaw);\n\n    processed++;\n\n    if (!folderName) {\n      Logger.log(`Row ${r}: unknown company \"${companyRaw}\" (ID=${id}), skipping`);\n      continue;\n    }\n\n    Logger.log(`Row ${r}: searching ID=\"${id}\", folder=\"${folderName}\"`);\n\n    let foundUrl = '';\n    const folders = DriveApp.getFoldersByName(folderName);\n    if (folders.hasNext()) {\n      const root = folders.next();\n      foundUrl = searchFolderRecursively_(root, id, []); // keep keywords empty unless you want prioritization\n    } else {\n      Logger.log(`Row ${r}: root folder not found: \"${folderName}\"`);\n    }\n\n    sheet.getRange(r, ML_CONFIG.COL_LINK).setValue(foundUrl || 'No list found');\n    updated++;\n  }\n\n  // Completed full scan; clear resume pointer\n  props.deleteProperty(ML_CONFIG.PROP_KEY_ROW);\n  Logger.log(`populateMaterialListLinks_JobTracking() complete. Processed=${processed} Updated=${updated}`);\n}\n\n/* =========================\n * Helpers\n * ========================= */\n\nfunction findLastNonEmptyRowInColumn_(sheet, col, startRow) {\n  const lastRow = sheet.getLastRow();\n  if (lastRow < startRow) return 0;\n\n  // Read the whole column slice once\n  const vals = sheet.getRange(startRow, col, lastRow - startRow + 1, 1).getDisplayValues();\n\n  for (let i = vals.length - 1; i >= 0; i--) {\n    if (String(vals[i][0] || '').trim() !== '') return startRow + i;\n  }\n  return 0;\n}\n\n// Map D value to the correct root folder\nfunction getFolderNameForCompany_(companyRaw) {\n  if (!companyRaw) return '';\n  const v = companyRaw.toLowerCase();\n\n  if (v.indexOf('bell mech') !== -1) return 'Material Lists - Bell Mechanical';\n  if (v.indexOf('pack timco') !== -1) return 'Material Lists - Pack Timco';\n  if (v.indexOf('metro') !== -1) return 'Material Lists - Metro Aire';\n  if (v.indexOf('mck') !== -1) return 'Material Lists - MCK Plumbing';\n\n  return '';\n}\n\n// ─── HELPER: check if filename contains any keyword ───\nfunction filenameMatchesKeywords_(fileNameLower, keywords) {\n  if (!keywords || keywords.length === 0) return false;\n  for (var i = 0; i < keywords.length; i++) {\n    if (fileNameLower.indexOf(keywords[i]) !== -1) return true;\n  }\n  return false;\n}\n\n// ─── HELPER: process a list of Drive Files; return URL if code matched in C5 ───\nfunction checkFilesForCode_(files, code) {\n  while (files.length) {\n    var file = files.shift();\n    try {\n      var ssFile = SpreadsheetApp.openById(file.getId());\n      var matIn = ssFile.getSheetByName('Material Input');\n      if (!matIn) {\n        Logger.log('      ' + file.getName() + ': no \"Material Input\" sheet');\n        continue;\n      }\n      var c5 = matIn.getRange('C5').getDisplayValue().toString().trim();\n      if (c5 === code) {\n        Logger.log('      MATCH in file: ' + file.getName());\n        return file.getUrl();\n      }\n    } catch (e) {\n      Logger.log('      Error opening \"' + file.getName() + '\": ' + e);\n    }\n  }\n  return '';\n}\n\n// ─── HELPER: recursively search folders ───\nfunction searchFolderRecursively_(folder, code, keywords) {\n  var prefer = [];\n  var others = [];\n  var it = folder.getFilesByType(MimeType.GOOGLE_SHEETS);\n  while (it.hasNext()) {\n    var f = it.next();\n    var nameLower = f.getName().toLowerCase();\n    if (filenameMatchesKeywords_(nameLower, keywords)) {\n      prefer.push(f);\n    } else {\n      others.push(f);\n    }\n  }\n  if (prefer.length || others.length) {\n    Logger.log('    Folder \"' + folder.getName() + '\": ' + prefer.length + ' prioritized, ' + others.length + ' other files');\n  }\n\n  var url = checkFilesForCode_(prefer, code);\n  if (url) return url;\n\n  url = checkFilesForCode_(others, code);\n  if (url) return url;\n\n  var subs = folder.getFolders();\n  while (subs.hasNext()) {\n    var sub = subs.next();\n    Logger.log('    Descending into subfolder: ' + sub.getName());\n    var found = searchFolderRecursively_(sub, code, keywords);\n    if (found) return found;\n  }\n\n  return '';\n}\n",
+      "lastModifyUser": {
+        "domain": "bellmech.com",
+        "email": "blake@bellmech.com",
+        "name": "Blake Bennett",
+        "photoUrl": "https://lh3.googleusercontent.com/a/ACg8ocI4azoPqdnaq5N-wsG2B9uF-cVybOe6LZwpNAHKrecBvUw-9Q=h128"
+      },
+      "createTime": "2026-02-03T19:35:46.929Z",
+      "updateTime": "2026-03-25T15:48:37.446Z",
+      "functionSet": {
+        "values": [
+          {
+            "name": "populateMaterialListLinks_JobTracking"
+          },
+          {
+            "name": "findLastNonEmptyRowInColumn_",
+            "parameters": [
+              "sheet",
+              "col",
+              "startRow"
+            ]
+          },
+          {
+            "name": "getFolderNameForCompany_",
+            "parameters": [
+              "companyRaw"
+            ]
+          },
+          {
+            "name": "filenameMatchesKeywords_",
+            "parameters": [
+              "fileNameLower",
+              "keywords"
+            ]
+          },
+          {
+            "name": "checkFilesForCode_",
+            "parameters": [
+              "files",
+              "code"
+            ]
+          },
+          {
+            "name": "searchFolderRecursively_",
+            "parameters": [
+              "folder",
+              "code",
+              "keywords"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "Subcontractor Estimates",
+      "type": "SERVER_JS",
+      "source": "/**\n * Subcontractor Estimates (PMT IMPORT OVERRIDE FIRST, RAW EMAIL BACKUP) + INSTALL ADDRESS -> COL B\n *\n * TARGET SHEET: \"Subcontractor Estimates\"\n * A Job Name | B Install Address | C Electrical ($) | D Drilling ($) | E Permitting ($) | F Labor ($) | G Snippets\n *\n * OVERRIDE RULE (FIRST):\n * 1) Look for exact matching Job Name in column A of tab \"PMT Import\"\n * 2) If found AND AE (Drilling) is NON-ZERO:\n *    - Set Drilling ($) = value from column AE of PMT Import (same row)\n *    - Set Electrical/Permitting/Labor = 0\n *    - Set B = \"-\"\n *    - Set Snippets = \"PMT Import AE\"\n *    - Next job\n * 3) If found but AE is zero/blank: IGNORE PMT and parse emails normally.\n *\n * EMAIL RULE (BACKUP):\n * - Use sheet \"HVACBizPro Raw Emails\" (D subject, E body)\n * - Pick ONE best matching email (no summing across many emails)\n * - Parse priced items \"@ $amount\" and categorize by canonical similarity\n * - Extract Install Address from the chosen body and write to column B\n *\n * ADDRESS RULE (YOUR CHANGE):\n * - Find \"Install Address\"\n * - Take the text AFTER the LAST COMMA within that Install Address block\n *   Example: \"123 Main St, Town, NY 12345\" -> \"NY 12345\"\n *\n * LOGGING:\n * - Execution log only (console.log)\n */\n\nfunction updateSubcontractorEstimatesFromRawEmails() {\n  const ss = SpreadsheetApp.getActiveSpreadsheet();\n\n  const SC_EST_TARGET_SHEET_NAME = \"Subcontractor Estimates\";\n  const SC_EST_RAW_SHEET_NAME = \"HVACBizPro Raw Emails\";\n  const SC_EST_PMT_SHEET_NAME = \"PMT Import\";\n\n  const targetSheet = ss.getSheetByName(SC_EST_TARGET_SHEET_NAME);\n  if (!targetSheet) throw new Error(\"Missing sheet: \" + SC_EST_TARGET_SHEET_NAME);\n\n  const rawSheet = ss.getSheetByName(SC_EST_RAW_SHEET_NAME);\n  if (!rawSheet) throw new Error(\"Missing sheet: \" + SC_EST_RAW_SHEET_NAME);\n\n  const pmtSheet = ss.getSheetByName(SC_EST_PMT_SHEET_NAME);\n  if (!pmtSheet) throw new Error(\"Missing sheet: \" + SC_EST_PMT_SHEET_NAME);\n\n  SC_EST_ensureHeaders_(targetSheet);\n\n  const targetLastRow = SC_EST_findLastNonEmptyRowInColumn_(targetSheet, 1, 2);\n  if (targetLastRow < 2) {\n    console.log(\"No data rows (no Job Names in column A).\");\n    return;\n  }\n\n  const pmtLastRow = pmtSheet.getLastRow();\n  const pmtMap = SC_EST_buildPmtJobToAeMap_(pmtSheet, pmtLastRow);\n\n  const rawLastRow = rawSheet.getLastRow();\n  const rawValues = (rawLastRow >= 2)\n    ? rawSheet.getRange(2, 4, rawLastRow - 1, 2).getValues()\n    : [];\n\n  console.log(\n    `RUN_START updateSubcontractorEstimatesFromRawEmails | TargetRows=2-${targetLastRow} | ` +\n    `PMT_Entries=${Object.keys(pmtMap).length} | RawEmails=${rawValues.length}`\n  );\n\n  for (let r = 2; r <= targetLastRow; r++) {\n    const jobName = String(targetSheet.getRange(r, 1).getDisplayValue() || \"\").trim();\n\n    if (!jobName) {\n      targetSheet.getRange(r, 2, 1, 6).setValues([[\"-\", \"-\", \"-\", \"-\", \"-\", \"No Subcontractor\"]]);\n      console.log(`Row ${r} | Job=\"\" | No Subcontractor`);\n      continue;\n    }\n\n    const pmtKey = SC_EST_normKey_(jobName);\n    if (Object.prototype.hasOwnProperty.call(pmtMap, pmtKey)) {\n      const drillingVal = pmtMap[pmtKey];\n      if (drillingVal !== 0) {\n        targetSheet.getRange(r, 2, 1, 6).setValues([[\"-\", 0, drillingVal, 0, 0, \"PMT Import AE\"]]);\n        console.log(`Row ${r} | Job=\"${jobName}\" | Mode=PMT_IMPORT | Drill=${drillingVal}`);\n        continue;\n      } else {\n        console.log(`Row ${r} | Job=\"${jobName}\" | PMT found but AE=0 -> ignoring PMT, using EMAIL parse`);\n      }\n    }\n\n    const chosen = SC_EST_pickAndParseBestEmailForQuery_(jobName, rawValues, {\n      requireLastNameInSubject: true,\n      minTokenHits: 2,\n      maxLineItem: 50000\n    });\n\n    const installAddr = chosen.installAddress || \"-\";\n\n    const rowValues = SC_EST_hasAnyAmounts_(chosen.agg)\n      ? [installAddr, chosen.agg.elec, chosen.agg.drill, chosen.agg.permit, chosen.agg.labor, SC_EST_dedupeSnippets_(chosen.agg.snips).join(\" | \")]\n      : [installAddr, \"-\", \"-\", \"-\", \"-\", \"No Subcontractor\"];\n\n    targetSheet.getRange(r, 2, 1, 6).setValues([rowValues]);\n\n    console.log(\n      `Row ${r} | Job=\"${jobName}\" | Mode=EMAIL_job | Matches=${chosen.matches} | BestScore=${chosen.bestScore} | ` +\n      `AddrFound=${installAddr !== \"-\" ? \"Y\" : \"N\"} | Addr=\"${installAddr}\" | ` +\n      `Elec=${rowValues[1]} Drill=${rowValues[2]} Permit=${rowValues[3]} Labor=${rowValues[4]}`\n    );\n  }\n\n  console.log(\"RUN_END updateSubcontractorEstimatesFromRawEmails\");\n}\n\n/* ======================== PMT IMPORT MAP ======================== */\n\nfunction SC_EST_buildPmtJobToAeMap_(pmtSheet, pmtLastRow) {\n  const map = Object.create(null);\n  if (pmtLastRow < 2) return map;\n\n  const numCols = 31; // A..AE\n  const vals = pmtSheet.getRange(2, 1, pmtLastRow - 1, numCols).getDisplayValues();\n\n  for (let i = 0; i < vals.length; i++) {\n    const job = String(vals[i][0] || \"\").trim();      // A\n    const aeStr = String(vals[i][30] || \"\").trim();   // AE\n    if (!job) continue;\n\n    const key = SC_EST_normKey_(job);\n    const aeNum = SC_EST_parseMoney_(aeStr);\n\n    if (!Object.prototype.hasOwnProperty.call(map, key)) map[key] = aeNum;\n    else if (aeNum !== 0) map[key] = aeNum;\n  }\n\n  return map;\n}\n\nfunction SC_EST_parseMoney_(s) {\n  const x = String(s || \"\").replace(/[^0-9.\\-]/g, \"\");\n  const n = Number(x);\n  return isFinite(n) ? n : 0;\n}\n\nfunction SC_EST_normKey_(s) {\n  return String(s || \"\").toLowerCase().replace(/\\s+/g, \" \").trim();\n}\n\n/* ======================== PICK ONE BEST EMAIL (SCORING) ======================== */\n\nfunction SC_EST_pickAndParseBestEmailForQuery_(querySource, rawValues, opts) {\n  const options = opts || {};\n  const minTokenHits = Number(options.minTokenHits || 2);\n  const requireLastNameInSubject = !!options.requireLastNameInSubject;\n  const maxLineItem = Number(options.maxLineItem || 50000);\n\n  const queryTokens = SC_EST_tokenize_(querySource).slice(0, 6);\n  const lastNameToken = SC_EST_extractLastNameToken_(querySource);\n\n  let matches = 0;\n  let bestIdx = -1;\n  let bestScore = -1;\n\n  for (let i = 0; i < rawValues.length; i++) {\n    const subj = String(rawValues[i][0] || \"\");\n    const body = String(rawValues[i][1] || \"\");\n    if (!subj && !body) continue;\n\n    const subjLower = subj.toLowerCase();\n    const hayLower = (subj + \" \" + body).toLowerCase();\n\n    if (subjLower.indexOf(\"financial summary :\") === -1) continue;\n    if (hayLower.indexOf(\"@\") === -1) continue;\n    if (hayLower.indexOf(\"$\") === -1) continue;\n\n    if (requireLastNameInSubject && lastNameToken) {\n      if (subjLower.indexOf(lastNameToken) === -1) continue;\n    }\n\n    let hits = 0;\n    let subjHits = 0;\n    for (const t of queryTokens) {\n      if (hayLower.indexOf(t) !== -1) hits++;\n      if (subjLower.indexOf(t) !== -1) subjHits++;\n    }\n    if (hits < minTokenHits) continue;\n\n    matches++;\n\n    const lnBonus = (lastNameToken && subjLower.indexOf(lastNameToken) !== -1) ? 3 : 0;\n    const score = (subjHits * 5) + (hits * 2) + lnBonus;\n\n    if (score > bestScore) {\n      bestScore = score;\n      bestIdx = i;\n    }\n  }\n\n  const agg = SC_EST_initAgg_();\n  if (bestIdx === -1) return { agg, matches, bestScore: 0, installAddress: \"\" };\n\n  const bestSubj = String(rawValues[bestIdx][0] || \"\");\n  const bestBody = String(rawValues[bestIdx][1] || \"\");\n\n  const installAddress = SC_EST_extractInstallAddressAfterLastComma_(bestBody);\n\n  const parsed = SC_EST_categorizeAndSumByExactLines_(bestBody, maxLineItem);\n  agg.elec = parsed.electricalTotal;\n  agg.drill = parsed.drillingTotal;\n  agg.permit = parsed.permittingTotal;\n  agg.labor = parsed.laborTotal;\n  agg.snips = parsed.snippets;\n\n  console.log(\n    `BestEmail | Query=\"${querySource}\" | LastName=\"${lastNameToken || \"\"}\" | ` +\n    `BestScore=${bestScore} | Subject=\"${bestSubj}\" | InstallAddress=\"${installAddress || \"\"}\"`\n  );\n\n  return { agg, matches, bestScore, installAddress };\n}\n\nfunction SC_EST_extractInstallAddressAfterLastComma_(body) {\n  const full = SC_EST_extractInstallAddressBlock_(body);\n  if (!full) return \"\";\n\n  // take text after the last comma\n  const lastComma = full.lastIndexOf(\",\");\n  if (lastComma === -1) return full.trim();\n\n  return full.slice(lastComma + 1).trim();\n}\n\n/**\n * Extracts the \"Install Address\" block as a single line (may join up to 3 lines).\n */\nfunction SC_EST_extractInstallAddressBlock_(body) {\n  const text = String(body || \"\")\n    .replace(/\\r\\n/g, \"\\n\")\n    .replace(/\\r/g, \"\\n\");\n\n  const lower = text.toLowerCase();\n  const idx = lower.indexOf(\"install address\");\n  if (idx === -1) return \"\";\n\n  let after = text.slice(idx + \"install address\".length);\n  after = after.replace(/^[ \\t]*[:\\-–—]?[ \\t]*/g, \"\");\n\n  const lines = after.split(\"\\n\").map(l => l.trim());\n  const stopLabelRe = /^(billing address|mailing address|install date|customer|phone|email|job name|project|scope|financial summary|total|notes)\\b/i;\n\n  const out = [];\n  for (let i = 0; i < lines.length && out.length < 3; i++) {\n    const l = lines[i];\n    if (!l) continue;\n\n    if (stopLabelRe.test(l)) break;\n    if (/^[A-Za-z][A-Za-z \\t]{2,30}:\\s*/.test(l)) break;\n\n    out.push(l);\n  }\n\n  if (!out.length) {\n    const m = text.match(/Install Address\\s*[:\\-–—]\\s*([^\\n\\r]+)/i);\n    if (m && m[1]) return String(m[1]).trim();\n    return \"\";\n  }\n\n  return out.join(\", \").replace(/\\s+/g, \" \").trim();\n}\n\nfunction SC_EST_extractLastNameToken_(jobName) {\n  const toks = SC_EST_tokenize_(jobName);\n  if (!toks.length) return \"\";\n\n  const stop = new Set([\"install\", \"job\", \"project\", \"street\", \"avenue\", \"road\", \"drive\", \"lane\", \"court\", \"place\", \"unit\"]);\n  for (const t of toks) {\n    if (t.length < 3) continue;\n    if (stop.has(t)) continue;\n    if (/^\\d+$/.test(t)) continue;\n    return t;\n  }\n  return toks[0] || \"\";\n}\n\n/* ======================== EXACT LINE MATCH (SLIGHT VARIATION) ======================== */\n\nfunction SC_EST_categorizeAndSumByExactLines_(text, maxLineItem) {\n  const normalized = String(text || \"\")\n    .replace(/\\r\\n/g, \"\\n\")\n    .replace(/\\r/g, \"\\n\")\n    .replace(/[ \\t]+/g, \" \")\n    .trim();\n\n  const items = SC_EST_extractPricedItems_(normalized, maxLineItem);\n\n  let electricalTotal = 0;\n  let drillingTotal = 0;\n  let permittingTotal = 0;\n  let laborTotal = 0;\n\n  const snippets = [];\n\n  for (const it of items) {\n    const cat = SC_EST_categoryFromCanonicalSimilarity_(it.itemText);\n    if (!cat) continue;\n\n    if (cat === \"electrical\") electricalTotal += it.amount;\n    if (cat === \"drilling\") drillingTotal += it.amount;\n    if (cat === \"permitting\") permittingTotal += it.amount;\n    if (cat === \"labor\") laborTotal += it.amount;\n\n    snippets.push(`${cat.toUpperCase()}: ${it.rawSnippet}`);\n  }\n\n  return { electricalTotal, drillingTotal, permittingTotal, laborTotal, snippets };\n}\n\nfunction SC_EST_extractPricedItems_(body, maxLineItem) {\n  const out = [];\n  const cap = isFinite(maxLineItem) ? maxLineItem : 50000;\n  const re = /@\\s*\\$?\\s*([0-9][0-9,]*(?:\\.[0-9]{1,2})?)/g;\n\n  let m;\n  while ((m = re.exec(body)) !== null) {\n    const amount = Number(String(m[1]).replace(/,/g, \"\"));\n    if (!isFinite(amount)) continue;\n    if (amount > cap) continue;\n\n    const atIndex = m.index;\n    const startWindow = Math.max(0, atIndex - 260);\n    let before = body.slice(startWindow, atIndex).trim();\n\n    const lastComma = before.lastIndexOf(\",\");\n    if (lastComma >= 0 && lastComma > before.length - 220) {\n      before = before.slice(lastComma + 1).trim();\n    }\n\n    const rawSnippet = `${before} @ $${m[1]}`.replace(/\\s+/g, \" \").trim();\n    out.push({ itemText: before, amount, rawSnippet });\n  }\n\n  return out;\n}\n\nfunction SC_EST_categoryFromCanonicalSimilarity_(segment) {\n  const segNorm = SC_EST_normalizeLine_(segment);\n  const CANON = SC_EST_getCanonicalLines_();\n\n  const TH = { electrical: 0.88, drilling: 0.88, permitting: 0.80, labor: 0.90 };\n  const MUST = {\n    electrical: [\"ELECTRICAL\", \"PERMIT\"],\n    drilling: [\"GEOTHERMAL\", \"SUBCONTRACTOR\"],\n    permitting: [\"PERMIT\", \"PROCESS\", \"HOMEOWNER\"],\n    labor: []\n  };\n\n  if (SC_EST_passesMustWords_(segNorm, MUST.electrical) && SC_EST_isSimilarEnough_(segNorm, SC_EST_normalizeLine_(CANON.electrical), TH.electrical)) {\n    return \"electrical\";\n  }\n  if (SC_EST_passesMustWords_(segNorm, MUST.drilling) && SC_EST_isSimilarEnough_(segNorm, SC_EST_normalizeLine_(CANON.drilling), TH.drilling)) {\n    return \"drilling\";\n  }\n  if (SC_EST_passesMustWords_(segNorm, MUST.permitting) && SC_EST_isSimilarEnough_(segNorm, SC_EST_normalizeLine_(CANON.permitting), TH.permitting)) {\n    return \"permitting\";\n  }\n\n  for (const l of CANON.laborLines) {\n    const ln = SC_EST_normalizeLine_(l);\n    if (SC_EST_isSimilarEnough_(segNorm, ln, TH.labor)) return \"labor\";\n  }\n  return null;\n}\n\nfunction SC_EST_normalizeLine_(s) {\n  return String(s || \"\")\n    .toUpperCase()\n    .replace(/[“”]/g, '\"')\n    .replace(/[’]/g, \"'\")\n    .replace(/\\s+/g, \" \")\n    .trim();\n}\n\nfunction SC_EST_passesMustWords_(segNorm, mustWords) {\n  if (!mustWords || !mustWords.length) return true;\n  let hits = 0;\n  for (const w of mustWords) if (segNorm.indexOf(w) !== -1) hits++;\n  const need = Math.min(2, mustWords.length);\n  return hits >= need;\n}\n\nfunction SC_EST_isSimilarEnough_(aNorm, bNorm, threshold) {\n  if (!aNorm || !bNorm) return false;\n  if (aNorm.indexOf(bNorm) !== -1 || bNorm.indexOf(aNorm) !== -1) return true;\n  const sim = SC_EST_normalizedSimilarity_(aNorm, bNorm);\n  return sim >= threshold;\n}\n\nfunction SC_EST_normalizedSimilarity_(a, b) {\n  const dist = SC_EST_levenshtein_(a, b);\n  const maxLen = Math.max(a.length, b.length) || 1;\n  return 1 - (dist / maxLen);\n}\n\nfunction SC_EST_levenshtein_(a, b) {\n  const m = a.length, n = b.length;\n  if (m === 0) return n;\n  if (n === 0) return m;\n\n  const dp = new Array(n + 1);\n  for (let j = 0; j <= n; j++) dp[j] = j;\n\n  for (let i = 1; i <= m; i++) {\n    let prev = dp[0];\n    dp[0] = i;\n    for (let j = 1; j <= n; j++) {\n      const tmp = dp[j];\n      const cost = a.charAt(i - 1) === b.charAt(j - 1) ? 0 : 1;\n      dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + cost);\n      prev = tmp;\n    }\n  }\n  return dp[n];\n}\n\nfunction SC_EST_getCanonicalLines_() {\n  return {\n    electrical: \"ELECTRICAL PERMIT AND THIRD PARTY INSPECTION INCLUDED (GFI NOT INCLUDED)\",\n    drilling: \"PROVIDE GEOTHERMAL WELLS WITH A LICENSED GEOTHERMAL SUBCONTRACTOR\",\n    permitting:\n      \"PERMIT PROCESS: WE WILL APPLY FOR THE PERMIT AND PASS THE COST TO THE HOMEOWNER ONCE RECEIVED. \" +\n      \"ELECTRICAL/PLUMBING PERMITS, ENGINEERING STAMPS/DRAWINGS, AND DUCT INTEGRITY TESTS ARE NOT INCLUDED IF REQUIRED BY THE BUILDING DEPARTMENT.\",\n    laborLines: [\n      \"DECOMMISSIONING OF EXISTING HEATING SYSTEM FOR REBATE MAXIMIZATION - ADDITIONAL COST\",\n      \"REMOVE AND DISPOSE OF PROPERLY EXISTING UNIT\",\n      \"RE-CONNECT EXISTING DUCTWORK\",\n      \"RE-CONNECT TO EXISTING PIPING, DUCTWORK AND ELECTRICAL\",\n      \"RE-CONNECT EXISTING REFRIGERANT PIPING AND FLUSH OUT\",\n      \"RE-CONNECT EXISTING OIL PIPING\",\n      \"RE-CONNECT EXISTING FLUE PIPING\",\n      \"RE-CONNECT EXISTING GAS PIPING\",\n      \"RE-CONNECT EXISTING DRAIN PIPING\",\n      \"START AND TEST COMPLETED INSTALLATION\"\n    ]\n  };\n}\n\n/* ======================== HEADERS ======================== */\n\nfunction SC_EST_ensureHeaders_(sheet) {\n  const headers = [\"Job Name\", \"Install Address\", \"Electrical ($)\", \"Drilling ($)\", \"Permitting ($)\", \"Labor ($)\", \"Snippets\"];\n  const current = sheet.getRange(1, 1, 1, headers.length).getValues()[0];\n\n  let mismatch = current.length !== headers.length;\n  if (!mismatch) {\n    for (let i = 0; i < headers.length; i++) {\n      if (current[i] !== headers[i]) { mismatch = true; break; }\n    }\n  }\n  if (mismatch) sheet.getRange(1, 1, 1, headers.length).setValues([headers]);\n}\n\n/* ======================== SNIPPET UTILS ======================== */\n\nfunction SC_EST_dedupeSnippets_(snips) {\n  const seen = new Set();\n  const out = [];\n  for (const s of snips || []) {\n    const k = String(s).toLowerCase();\n    if (seen.has(k)) continue;\n    seen.add(k);\n    out.push(s);\n    if (out.length >= 12) break;\n  }\n  return out;\n}\n\n/* ======================== TOKENS / AGG / SHEET UTILS ======================== */\n\nfunction SC_EST_tokenize_(s) {\n  return String(s || \"\")\n    .toLowerCase()\n    .replace(/[^\\w\\s]/g, \" \")\n    .split(/\\s+/)\n    .filter(w => w && w.length >= 3);\n}\n\nfunction SC_EST_initAgg_() {\n  return { elec: 0, drill: 0, permit: 0, labor: 0, snips: [] };\n}\n\nfunction SC_EST_hasAnyAmounts_(agg) {\n  return (agg.elec > 0) || (agg.drill > 0) || (agg.permit > 0) || (agg.labor > 0);\n}\n\nfunction SC_EST_findLastNonEmptyRowInColumn_(sheet, col, startRow) {\n  const max = sheet.getMaxRows();\n  const vals = sheet.getRange(startRow, col, max - startRow + 1, 1).getDisplayValues();\n  for (let i = vals.length - 1; i >= 0; i--) {\n    if (String(vals[i][0] || \"\").trim() !== \"\") return startRow + i;\n  }\n  return 0;\n}\n",
+      "lastModifyUser": {
+        "domain": "bellmech.com",
+        "email": "blake@bellmech.com",
+        "name": "Blake Bennett",
+        "photoUrl": "https://lh3.googleusercontent.com/a/ACg8ocI4azoPqdnaq5N-wsG2B9uF-cVybOe6LZwpNAHKrecBvUw-9Q=h128"
+      },
+      "createTime": "2026-02-08T19:00:10.819Z",
+      "updateTime": "2026-03-25T15:48:37.446Z",
+      "functionSet": {
+        "values": [
+          {
+            "name": "updateSubcontractorEstimatesFromRawEmails"
+          },
+          {
+            "name": "SC_EST_buildPmtJobToAeMap_",
+            "parameters": [
+              "pmtSheet",
+              "pmtLastRow"
+            ]
+          },
+          {
+            "name": "SC_EST_parseMoney_",
+            "parameters": [
+              "s"
+            ]
+          },
+          {
+            "name": "SC_EST_normKey_",
+            "parameters": [
+              "s"
+            ]
+          },
+          {
+            "name": "SC_EST_pickAndParseBestEmailForQuery_",
+            "parameters": [
+              "querySource",
+              "rawValues",
+              "opts"
+            ]
+          },
+          {
+            "name": "SC_EST_extractInstallAddressAfterLastComma_",
+            "parameters": [
+              "body"
+            ]
+          },
+          {
+            "name": "SC_EST_extractInstallAddressBlock_",
+            "parameters": [
+              "body"
+            ]
+          },
+          {
+            "name": "SC_EST_extractLastNameToken_",
+            "parameters": [
+              "jobName"
+            ]
+          },
+          {
+            "name": "SC_EST_categorizeAndSumByExactLines_",
+            "parameters": [
+              "text",
+              "maxLineItem"
+            ]
+          },
+          {
+            "name": "SC_EST_extractPricedItems_",
+            "parameters": [
+              "body",
+              "maxLineItem"
+            ]
+          },
+          {
+            "name": "SC_EST_categoryFromCanonicalSimilarity_",
+            "parameters": [
+              "segment"
+            ]
+          },
+          {
+            "name": "SC_EST_normalizeLine_",
+            "parameters": [
+              "s"
+            ]
+          },
+          {
+            "name": "SC_EST_passesMustWords_",
+            "parameters": [
+              "segNorm",
+              "mustWords"
+            ]
+          },
+          {
+            "name": "SC_EST_isSimilarEnough_",
+            "parameters": [
+              "aNorm",
+              "bNorm",
+              "threshold"
+            ]
+          },
+          {
+            "name": "SC_EST_normalizedSimilarity_",
+            "parameters": [
+              "a",
+              "b"
+            ]
+          },
+          {
+            "name": "SC_EST_levenshtein_",
+            "parameters": [
+              "a",
+              "b"
+            ]
+          },
+          {
+            "name": "SC_EST_getCanonicalLines_"
+          },
+          {
+            "name": "SC_EST_ensureHeaders_",
+            "parameters": [
+              "sheet"
+            ]
+          },
+          {
+            "name": "SC_EST_dedupeSnippets_",
+            "parameters": [
+              "snips"
+            ]
+          },
+          {
+            "name": "SC_EST_tokenize_",
+            "parameters": [
+              "s"
+            ]
+          },
+          {
+            "name": "SC_EST_initAgg_"
+          },
+          {
+            "name": "SC_EST_hasAnyAmounts_",
+            "parameters": [
+              "agg"
+            ]
+          },
+          {
+            "name": "SC_EST_findLastNonEmptyRowInColumn_",
+            "parameters": [
+              "sheet",
+              "col",
+              "startRow"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "JSON Getter",
+      "type": "SERVER_JS",
+      "source": "function exportProjectToJSON() {\n  var scriptId = ScriptApp.getScriptId();\n  var url = \"https://script.googleapis.com/v1/projects/\" + scriptId + \"/content\";\n\n  var response = UrlFetchApp.fetch(url, {\n    method: \"get\",\n    headers: {\n      Authorization: \"Bearer \" + ScriptApp.getOAuthToken()\n    }\n  });\n\n  var content = JSON.parse(response.getContentText());\n\n  var exportData = {\n    scriptId: scriptId,\n    exportedAt: new Date().toISOString(),\n    files: content.files || []\n  };\n\n  var json = JSON.stringify(exportData, null, 2);\n\n  var html = `\n    <html>\n      <body>\n        <a id=\"download\" download=\"appscript-project.json\"\n           href=\"data:application/json;charset=utf-8,${encodeURIComponent(json)}\">\n        </a>\n        <script>\n          document.getElementById('download').click();\n        </script>\n      </body>\n    </html>\n  `;\n\n  var output = HtmlService.createHtmlOutput(html);\n  SpreadsheetApp.getUi().showModalDialog(output, \"Download JSON\");\n}",
+      "lastModifyUser": {
+        "domain": "bellmech.com",
+        "email": "blake@bellmech.com",
+        "name": "Blake Bennett",
+        "photoUrl": "https://lh3.googleusercontent.com/a/ACg8ocI4azoPqdnaq5N-wsG2B9uF-cVybOe6LZwpNAHKrecBvUw-9Q=h128"
+      },
+      "createTime": "2026-03-25T15:37:10.642Z",
+      "updateTime": "2026-03-25T15:48:37.446Z",
+      "functionSet": {
+        "values": [
+          {
+            "name": "exportProjectToJSON"
+          }
+        ]
+      }
+    }
+  ]
+}
