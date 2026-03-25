@@ -1,0 +1,19 @@
+{
+  "timeZone": "America/New_York",
+  "dependencies": {
+    "enabledAdvancedServices": [
+      {
+        "userSymbol": "Sheets",
+        "version": "v4",
+        "serviceId": "sheets"
+      }
+    ]
+  },
+  "exceptionLogging": "STACKDRIVER",
+  "runtimeVersion": "V8",
+  "oauthScopes": [
+    "https://www.googleapis.com/auth/script.projects",
+    "https://www.googleapis.com/auth/script.external_request",
+    "https://www.googleapis.com/auth/script.container.ui"
+  ]
+}
