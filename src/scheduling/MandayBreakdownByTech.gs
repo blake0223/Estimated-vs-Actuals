@@ -84,23 +84,34 @@ function generateMandayBreakdownByTech() {
   const headerWeeks = headerWeeksRaw.map(v => v ? String(v).trim() : '');
   const headerKeys = headerWeeks.map(weekOrdinal_);
 
-  // ---- 5. Build "Tech Key": greyCellNames already holds the tech name at each
-  //   [row, col] before conversion to numeric values. Resolve each to the
-  //   canonical TechList display name so the output uses proper names.
-  //   techKey[row][col] = display name from TechList (or raw grey-cell text if not in TechList)
-  const techKey = [];
+  // ---- 5. Build row-to-tech mapping from grey cells ----
+  //   Grey cells hold tech names before the Week Key converts them to numbers.
+  //   For each row, find the most common tech name across its grey cells.
+  //   This tells us which tech owns each schedule row.
+  const rowToTech = {};  // rowIndex -> display name from TechList
   for (let i = 0; i < greyCellNames.length; i++) {
-    techKey[i] = [];
+    const counts = {};  // techDisplayName -> count
     for (let j = 0; j < (greyCellNames[i] || []).length; j++) {
       const raw = greyCellNames[i][j];
-      if (!raw) {
-        techKey[i][j] = '';
-      } else {
-        const norm = raw.toLowerCase();
-        techKey[i][j] = techDisplayNames[norm] || raw;
+      if (!raw) continue;
+      const norm = raw.toLowerCase();
+      const display = techDisplayNames[norm] || raw;
+      counts[display] = (counts[display] || 0) + 1;
+    }
+    // Pick the tech with the most grey-cell appearances in this row
+    let best = '';
+    let bestCount = 0;
+    for (const [name, count] of Object.entries(counts)) {
+      if (count > bestCount) {
+        best = name;
+        bestCount = count;
       }
     }
+    if (best) rowToTech[i] = best;
   }
+
+  console.log('Row-to-tech mapping (' + Object.keys(rowToTech).length + ' rows): ' +
+    Object.entries(rowToTech).map(([r, t]) => `r${Number(r)+1}=${t}`).join(', '));
 
   // ---- 6. Build in-memory manday map (identical to original MandayCalculatorPort) ----
   //   mandayMap[weekLabel][rowIndex] = numeric manday value
@@ -223,8 +234,8 @@ function generateMandayBreakdownByTech() {
           ? mandayMap[weekLabel][mandayRowIndex]
           : 0.5;
 
-        // Tech name from the Tech Key (grey-cell name before it became a number)
-        const techName = (techKey[row] && techKey[row][col]) || 'Unknown';
+        // Tech name from the row mapping (most common grey-cell tech in this row)
+        const techName = rowToTech[row] || 'Unknown';
 
         if (!techTotals[techName]) techTotals[techName] = 0;
         techTotals[techName] += Number(mandayValue);
