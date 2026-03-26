@@ -85,19 +85,42 @@ function generateMandayBreakdownByTech() {
   const headerKeys = headerWeeks.map(weekOrdinal_);
 
   // ---- 5. Determine which tech owns each schedule row ----
-  //   Scan ALL cells in each row (not just grey) for a known TechList name.
+  //   Scan ALL cells in each row for a known TechList name (substring word-boundary match).
   //   Use the canonical display name from TechList.
+  //   Build sorted list of tech names (longest first to avoid partial matches).
+  const allTechNorms = Object.keys(techSeries).sort((a, b) => b.length - a.length);
   const rowToTech = {};  // rowIndex -> display name from TechList
   for (let i = 0; i < scheduleData.length; i++) {
     if (i === 1 || i === 2) continue; // skip structural rows
-    for (let j = 0; j < scheduleData[i].length; j++) {
+    let found = false;
+    for (let j = 0; j < scheduleData[i].length && !found; j++) {
       const cellText = String(scheduleData[i][j] || '').trim();
       if (!cellText) continue;
-      const norm = cellText.toLowerCase();
-      if (techSeries[norm]) {
-        rowToTech[i] = techDisplayNames[norm] || cellText;
-        break; // first known tech name in this row wins
+      const cellLower = cellText.toLowerCase();
+
+      // Exact match first (fastest)
+      if (techSeries[cellLower]) {
+        rowToTech[i] = techDisplayNames[cellLower] || cellText;
+        found = true;
+        break;
       }
+
+      // Substring match: check if any TechList name appears as a word in this cell
+      for (const techNorm of allTechNorms) {
+        if (cellLower.indexOf(techNorm) === -1) continue;
+        // Verify word boundary: char before and after must be non-alphanumeric or start/end
+        const idx = cellLower.indexOf(techNorm);
+        const before = idx === 0 ? '' : cellLower[idx - 1];
+        const after = idx + techNorm.length >= cellLower.length ? '' : cellLower[idx + techNorm.length];
+        const boundaryBefore = !before || /[^a-z0-9]/.test(before);
+        const boundaryAfter = !after || /[^a-z0-9]/.test(after);
+        if (boundaryBefore && boundaryAfter) {
+          rowToTech[i] = techDisplayNames[techNorm] || techNorm;
+          found = true;
+          break;
+        }
+      }
+    }
     }
   }
 
