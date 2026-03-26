@@ -84,47 +84,23 @@ function generateMandayBreakdownByTech() {
   const headerWeeks = headerWeeksRaw.map(v => v ? String(v).trim() : '');
   const headerKeys = headerWeeks.map(weekOrdinal_);
 
-  // ---- 5. Determine which tech owns each schedule row ----
-  //   Scan ALL cells in each row for a known TechList name (substring word-boundary match).
-  //   Use the canonical display name from TechList.
-  //   Build sorted list of tech names (longest first to avoid partial matches).
-  const allTechNorms = Object.keys(techSeries).sort((a, b) => b.length - a.length);
-  const rowToTech = {};  // rowIndex -> display name from TechList
-  for (let i = 0; i < scheduleData.length; i++) {
-    if (i === 1 || i === 2) continue; // skip structural rows
-    let found = false;
-    for (let j = 0; j < scheduleData[i].length && !found; j++) {
-      const cellText = String(scheduleData[i][j] || '').trim();
-      if (!cellText) continue;
-      const cellLower = cellText.toLowerCase();
-
-      // Exact match first (fastest)
-      if (techSeries[cellLower]) {
-        rowToTech[i] = techDisplayNames[cellLower] || cellText;
-        found = true;
-        break;
-      }
-
-      // Substring match: check if any TechList name appears as a word in this cell
-      for (const techNorm of allTechNorms) {
-        if (cellLower.indexOf(techNorm) === -1) continue;
-        // Verify word boundary: char before and after must be non-alphanumeric or start/end
-        const idx = cellLower.indexOf(techNorm);
-        const before = idx === 0 ? '' : cellLower[idx - 1];
-        const after = idx + techNorm.length >= cellLower.length ? '' : cellLower[idx + techNorm.length];
-        const boundaryBefore = !before || /[^a-z0-9]/.test(before);
-        const boundaryAfter = !after || /[^a-z0-9]/.test(after);
-        if (boundaryBefore && boundaryAfter) {
-          rowToTech[i] = techDisplayNames[techNorm] || techNorm;
-          found = true;
-          break;
-        }
+  // ---- 5. Build "Tech Key": greyCellNames already holds the tech name at each
+  //   [row, col] before conversion to numeric values. Resolve each to the
+  //   canonical TechList display name so the output uses proper names.
+  //   techKey[row][col] = display name from TechList (or raw grey-cell text if not in TechList)
+  const techKey = [];
+  for (let i = 0; i < greyCellNames.length; i++) {
+    techKey[i] = [];
+    for (let j = 0; j < (greyCellNames[i] || []).length; j++) {
+      const raw = greyCellNames[i][j];
+      if (!raw) {
+        techKey[i][j] = '';
+      } else {
+        const norm = raw.toLowerCase();
+        techKey[i][j] = techDisplayNames[norm] || raw;
       }
     }
   }
-
-  console.log('Row-to-tech mapping: ' +
-    Object.entries(rowToTech).map(([r, t]) => `r${Number(r)+1}=${t}`).join(', '));
 
   // ---- 6. Build in-memory manday map (identical to original MandayCalculatorPort) ----
   //   mandayMap[weekLabel][rowIndex] = numeric manday value
@@ -247,8 +223,8 @@ function generateMandayBreakdownByTech() {
           ? mandayMap[weekLabel][mandayRowIndex]
           : 0.5;
 
-        // Tech name from the row-level mapping
-        const techName = rowToTech[row] || 'Unknown';
+        // Tech name from the Tech Key (grey-cell name before it became a number)
+        const techName = (techKey[row] && techKey[row][col]) || 'Unknown';
 
         if (!techTotals[techName]) techTotals[techName] = 0;
         techTotals[techName] += Number(mandayValue);
