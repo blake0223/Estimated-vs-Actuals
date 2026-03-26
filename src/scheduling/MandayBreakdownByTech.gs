@@ -231,7 +231,30 @@ function generateMandayBreakdownByTech() {
     }
   });
 
-  // ---- 9. Write results to "Mandays" tab in THIS spreadsheet ----
+  // ---- 9. Pivot results: techs as rows, job names as columns ----
+  //   Collect unique techs and job labels
+  const techSet = new Set();
+  const jobList = [];       // ordered list of { id, jobName, label }
+  const jobLabelSet = new Set();
+
+  for (const r of results) {
+    techSet.add(r.tech);
+    const label = r.jobName || r.id;
+    if (!jobLabelSet.has(r.id)) {
+      jobLabelSet.add(r.id);
+      jobList.push({ id: r.id, jobName: r.jobName, label });
+    }
+  }
+
+  const techs = Array.from(techSet).sort();
+  // Build lookup: pivot[tech][id] = mandays
+  const pivot = {};
+  for (const r of results) {
+    if (!pivot[r.tech]) pivot[r.tech] = {};
+    pivot[r.tech][r.id] = (pivot[r.tech][r.id] || 0) + r.mandays;
+  }
+
+  // ---- 10. Write pivot table to "Mandays" tab ----
   const outputSS = SpreadsheetApp.getActiveSpreadsheet();
   let outputSheet = outputSS.getSheetByName(MD_CONFIG.OUTPUT_SHEET_NAME);
   if (!outputSheet) {
@@ -240,19 +263,48 @@ function generateMandayBreakdownByTech() {
     outputSheet.clearContents();
   }
 
-  const headers = [['Pipedrive ID', 'Job Name', 'Tech', 'Mandays']];
-  outputSheet.getRange(1, 1, 1, 4).setValues(headers);
-  outputSheet.setFrozenRows(1);
+  // Header row: "Tech" + each job name + "Total"
+  const headerRow = ['Tech'];
+  for (const job of jobList) headerRow.push(job.label);
+  headerRow.push('Total');
 
-  if (results.length > 0) {
-    const rows2D = results.map(r => [r.id, r.jobName, r.tech, r.mandays]);
-    outputSheet.getRange(2, 1, rows2D.length, 4).setValues(rows2D);
+  // Data rows: one per tech
+  const dataRows = [];
+  for (const tech of techs) {
+    const row = [tech];
+    let techTotal = 0;
+    for (const job of jobList) {
+      const val = (pivot[tech] && pivot[tech][job.id]) || 0;
+      row.push(val);
+      techTotal += val;
+    }
+    row.push(techTotal);
+    dataRows.push(row);
   }
 
+  // Totals row at the bottom
+  const totalsRow = ['Total'];
+  let grandTotal = 0;
+  for (let c = 0; c < jobList.length; c++) {
+    let colSum = 0;
+    for (const dRow of dataRows) colSum += dRow[c + 1];
+    totalsRow.push(colSum);
+    grandTotal += colSum;
+  }
+  totalsRow.push(grandTotal);
+  dataRows.push(totalsRow);
+
+  const allRows = [headerRow, ...dataRows];
+  const numCols = headerRow.length;
+
+  outputSheet.getRange(1, 1, allRows.length, numCols).setValues(allRows);
+  outputSheet.setFrozenRows(1);
+  outputSheet.setFrozenColumns(1);
+
   const elapsed = Date.now() - t0;
-  console.log(`generateMandayBreakdownByTech() complete. Rows=${results.length} Elapsed=${elapsed}ms`);
+  console.log(`generateMandayBreakdownByTech() complete. Techs=${techs.length} Jobs=${jobList.length} Elapsed=${elapsed}ms`);
   SpreadsheetApp.getActive().toast(
-    `Done: ${results.length} rows written to "${MD_CONFIG.OUTPUT_SHEET_NAME}".`,
+    `Done: ${techs.length} techs x ${jobList.length} jobs written to "${MD_CONFIG.OUTPUT_SHEET_NAME}".`,
     'Manday Breakdown',
     5
   );
