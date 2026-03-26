@@ -69,20 +69,22 @@ function generateMandayBreakdownByTech() {
   }
 
   // ---- 4. Build TechList lookup (identical to MandayCalculatorPort) ----
-  const techSeries = buildTechSeries_(techListSheet);
+  const { series: techSeries, displayNames: techDisplayNames } = buildTechSeries_(techListSheet);
   const headerWeeksRaw = techListSheet.getRange('B2:P2').getValues()[0];
   const headerWeeks = headerWeeksRaw.map(v => v ? String(v).trim() : '');
   const headerKeys = headerWeeks.map(weekOrdinal_);
 
   // ---- 5. Determine which tech owns each schedule row ----
   //   Scan every grey cell in a row; the first one matching a known TechList name wins.
-  const rowToTech = {};  // rowIndex -> tech name (original casing)
+  //   Use the canonical display name from TechList, not the grey cell text.
+  const rowToTech = {};  // rowIndex -> display name from TechList
   for (let i = 0; i < greyCellNames.length; i++) {
     for (let j = 0; j < (greyCellNames[i] || []).length; j++) {
       const name = greyCellNames[i][j];
       if (!name) continue;
-      if (techSeries[name.toLowerCase()]) {
-        rowToTech[i] = name;
+      const norm = name.toLowerCase();
+      if (techSeries[norm]) {
+        rowToTech[i] = techDisplayNames[norm] || name;
         break; // first known tech name in this row wins
       }
     }
@@ -328,7 +330,8 @@ function weekOrdinal_(label) {
 }
 
 /**
- * Build { "tech name (lower)": [leftFilled values B..P] } from TechList.
+ * Build tech lookup from TechList.
+ * Returns { series: { "lower name": [leftFilled values] }, displayNames: { "lower name": "Original Name" } }
  */
 function buildTechSeries_(techListSheet) {
   const lastTechRow = techListSheet.getRange('A:A').getLastRow();
@@ -342,8 +345,10 @@ function buildTechSeries_(techListSheet) {
     : [];
 
   const techSeries = {};
+  const displayNames = {};
   for (let r = 0; r < techRowCount; r++) {
-    const nameNorm = String(techNames[r] || '').trim().toLowerCase();
+    const nameRaw = String(techNames[r] || '').trim();
+    const nameNorm = nameRaw.toLowerCase();
     if (!nameNorm) continue;
 
     const rowVals = techValues[r].slice();
@@ -358,9 +363,10 @@ function buildTechSeries_(techListSheet) {
       }
     }
     techSeries[nameNorm] = rowVals;
+    if (!displayNames[nameNorm]) displayNames[nameNorm] = nameRaw;
   }
 
-  return techSeries;
+  return { series: techSeries, displayNames };
 }
 
 /**
