@@ -121,9 +121,10 @@ function generateMandayBreakdownByTech() {
 
   const jtData = jobTracking.getRange(2, 1, jtLastRow - 1, JT_COL_MANDAYS).getValues();
 
-  const today = techListSheet.getRange('R1').getValue();
-  if (!(today instanceof Date)) {
-    throw new Error('Invalid date in TechList!R1.');
+  const todayRaw = techListSheet.getRange('R1').getValue();
+  const today = (todayRaw instanceof Date) ? todayRaw : new Date(todayRaw);
+  if (isNaN(today.getTime())) {
+    throw new Error('Invalid date in TechList!R1: ' + todayRaw);
   }
 
   const cutoffDate = new Date(today);
