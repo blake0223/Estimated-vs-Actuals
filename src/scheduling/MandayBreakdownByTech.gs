@@ -74,35 +74,38 @@ function generateMandayBreakdownByTech() {
   const headerWeeks = headerWeeksRaw.map(v => v ? String(v).trim() : '');
   const headerKeys = headerWeeks.map(weekOrdinal_);
 
-  // ---- 5. Build in-memory manday grid from grey cells + TechList ----
-  //   mandayGrid[row][col] = { value: Number, techName: String }
-  const mandayGrid = [];
+  // ---- 5. Determine which tech owns each schedule row ----
+  //   Scan every grey cell in a row; the first one matching a known TechList name wins.
+  const rowToTech = {};  // rowIndex -> tech name (original casing)
   for (let i = 0; i < greyCellNames.length; i++) {
-    mandayGrid[i] = [];
-    for (let j = 0; j < greyCellNames[i].length; j++) {
-      const techName = greyCellNames[i][j];
-      if (!techName) {
-        mandayGrid[i][j] = { value: 0.5, techName: '' };
-        continue;
+    for (let j = 0; j < (greyCellNames[i] || []).length; j++) {
+      const name = greyCellNames[i][j];
+      if (!name) continue;
+      if (techSeries[name.toLowerCase()]) {
+        rowToTech[i] = name;
+        break; // first known tech name in this row wins
       }
-
-      const norm = techName.toLowerCase();
-      const weekLabel = weekLabels[j];
-      const value = getTechValueForWeek_(norm, weekLabel, techSeries, headerKeys);
-      mandayGrid[i][j] = { value, techName };
     }
   }
 
-  // ---- 6. Build in-memory manday map (for cells without a grey-cell tech name) ----
-  //   Falls back to 0.5 with tech = "Unknown"
+  console.log('Row-to-tech mapping: ' +
+    Object.entries(rowToTech).map(([r, t]) => `r${Number(r)+1}=${t}`).join(', '));
+
+  // ---- 6. Build in-memory manday map (identical to original MandayCalculatorPort) ----
+  //   mandayMap[weekLabel][rowIndex] = numeric manday value
+  //   Grey cells with known tech names get their TechList value; everything else = 0.5
   const mandayMap = {};
   for (let j = 0; j < weekLabels.length; j++) {
     const wl = weekLabels[j];
     if (!wl) continue;
     mandayMap[wl] = [];
     for (let i = 1; i < Math.min(MD_CONFIG.MAX_SCHEDULE_ROW, scheduleData.length); i++) {
-      const cell = mandayGrid[i] && mandayGrid[i][j];
-      mandayMap[wl].push(cell ? cell.value : 0.5);
+      const techName = greyCellNames[i] && greyCellNames[i][j];
+      if (techName && techSeries[techName.toLowerCase()]) {
+        mandayMap[wl].push(getTechValueForWeek_(techName.toLowerCase(), wl, techSeries, headerKeys));
+      } else {
+        mandayMap[wl].push(0.5);
+      }
     }
   }
 
@@ -203,10 +206,14 @@ function generateMandayBreakdownByTech() {
 
         if (!match) continue;
 
-        // Look up the tech name and manday value at this position
-        const cell = mandayGrid[row] && mandayGrid[row][col];
-        const mandayValue = cell ? cell.value : 0.5;
-        const techName = (cell && cell.techName) ? cell.techName : 'Unknown';
+        // Manday value from the positional map (same as original)
+        const mandayRowIndex = row - 1;
+        const mandayValue = (mandayMap[weekLabel] && mandayMap[weekLabel][mandayRowIndex])
+          ? mandayMap[weekLabel][mandayRowIndex]
+          : 0.5;
+
+        // Tech name from the row-level mapping
+        const techName = rowToTech[row] || 'Unknown';
 
         if (!techTotals[techName]) techTotals[techName] = 0;
         techTotals[techName] += Number(mandayValue);
