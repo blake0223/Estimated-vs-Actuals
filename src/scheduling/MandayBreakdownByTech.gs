@@ -84,6 +84,25 @@ function generateMandayBreakdownByTech() {
   const headerWeeks = headerWeeksRaw.map(v => v ? String(v).trim() : '');
   const headerKeys = headerWeeks.map(weekOrdinal_);
 
+  // ---- DIAGNOSTIC: log grey cell stats and TechList names ----
+  let totalGreyCells = 0;
+  const greyUniqueValues = new Set();
+  const unmatchedGreyValues = new Set();
+  for (let i = 0; i < greyCellNames.length; i++) {
+    for (let j = 0; j < (greyCellNames[i] || []).length; j++) {
+      const v = greyCellNames[i][j];
+      if (!v) continue;
+      totalGreyCells++;
+      greyUniqueValues.add(v);
+      if (!techSeries[v.toLowerCase()]) unmatchedGreyValues.add(v);
+    }
+  }
+  console.log('Grey color code from A4: ' + greyColorCode);
+  console.log('Total grey cells found: ' + totalGreyCells);
+  console.log('Unique grey cell values (' + greyUniqueValues.size + '): ' + Array.from(greyUniqueValues).slice(0, 50).join(', '));
+  console.log('TechList names (' + Object.keys(techSeries).length + '): ' + Object.keys(techDisplayNames).map(k => techDisplayNames[k]).join(', '));
+  console.log('Grey values NOT in TechList (' + unmatchedGreyValues.size + '): ' + Array.from(unmatchedGreyValues).slice(0, 50).join(', '));
+
   // ---- 5. Build row-to-tech mapping from grey cells ----
   //   Grey cells hold tech names before the Week Key converts them to numbers.
   //   For each row, find the most common tech name across its grey cells.
