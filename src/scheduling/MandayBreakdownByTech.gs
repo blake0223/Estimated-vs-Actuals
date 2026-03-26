@@ -19,7 +19,6 @@
 const MD_CONFIG = {
   SOURCE_SPREADSHEET_ID: '1MnkDZSNcNR4RFiPE3-QfSVtEvZ_M_qS_KdRHGiFyAvY',
   OUTPUT_SHEET_NAME: 'Mandays',
-  MAX_SCHEDULE_ROW: 75,
 };
 
 /* ==============================================================
@@ -76,8 +75,12 @@ function generateMandayBreakdownByTech() {
   }
 
   // ---- 4. Build TechList lookup (identical to MandayCalculatorPort) ----
-  const { series: techSeries, displayNames: techDisplayNames } = buildTechSeries_(techListSheet);
-  const headerWeeksRaw = techListSheet.getRange('B2:P2').getValues()[0];
+  const techListLastCol = techListSheet.getLastColumn();
+  const techListValueCols = Math.max(0, techListLastCol - 1); // cols B onward
+  const { series: techSeries, displayNames: techDisplayNames } = buildTechSeries_(techListSheet, techListValueCols);
+  const headerWeeksRaw = techListValueCols > 0
+    ? techListSheet.getRange(2, 2, 1, techListValueCols).getValues()[0]
+    : [];
   const headerWeeks = headerWeeksRaw.map(v => v ? String(v).trim() : '');
   const headerKeys = headerWeeks.map(weekOrdinal_);
 
@@ -108,7 +111,7 @@ function generateMandayBreakdownByTech() {
     const wl = weekLabels[j];
     if (!wl) continue;
     mandayMap[wl] = [];
-    for (let i = 1; i < Math.min(MD_CONFIG.MAX_SCHEDULE_ROW, scheduleData.length); i++) {
+    for (let i = 1; i < scheduleData.length; i++) {
       const techName = greyCellNames[i] && greyCellNames[i][j];
       if (techName && techSeries[techName.toLowerCase()]) {
         mandayMap[wl].push(getTechValueForWeek_(techName.toLowerCase(), wl, techSeries, headerKeys));
@@ -204,7 +207,7 @@ function generateMandayBreakdownByTech() {
       const currentWeekDate = new Date(weekDate);
       if (currentWeekDate < startDate || currentWeekDate > cutoffDate) continue;
 
-      for (let row = 1; row < Math.min(MD_CONFIG.MAX_SCHEDULE_ROW, scheduleData.length); row++) {
+      for (let row = 1; row < scheduleData.length; row++) {
         const cellValue = scheduleData[row][col];
         if (!cellValue) continue;
 
@@ -340,15 +343,15 @@ function weekOrdinal_(label) {
  * Build tech lookup from TechList.
  * Returns { series: { "lower name": [leftFilled values] }, displayNames: { "lower name": "Original Name" } }
  */
-function buildTechSeries_(techListSheet) {
+function buildTechSeries_(techListSheet, valueCols) {
   const lastTechRow = techListSheet.getRange('A:A').getLastRow();
   const techRowCount = Math.max(0, lastTechRow - 3);
 
   const techNames = techRowCount
     ? techListSheet.getRange(4, 1, techRowCount, 1).getValues().flat()
     : [];
-  const techValues = techRowCount
-    ? techListSheet.getRange(4, 2, techRowCount, 16).getValues()
+  const techValues = (techRowCount && valueCols > 0)
+    ? techListSheet.getRange(4, 2, techRowCount, valueCols).getValues()
     : [];
 
   const techSeries = {};
