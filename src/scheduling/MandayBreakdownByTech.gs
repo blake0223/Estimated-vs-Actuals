@@ -26,6 +26,13 @@ const MD_CONFIG = {
  * ENTRY POINT
  * ============================================================== */
 
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('Mandays')
+    .addItem('Generate Breakdown by Tech', 'generateMandayBreakdownByTech')
+    .addToUi();
+}
+
 function generateMandayBreakdownByTech() {
   const t0 = Date.now();
   console.log('generateMandayBreakdownByTech() start');
