@@ -297,8 +297,8 @@ function generateMandayBreakdownByTech() {
   const allRows = [headerRow, ...dataRows];
   const numCols = headerRow.length;
 
-  outputSheet.getRange(1, 1, allRows.length, numCols).setValues(allRows);
-  outputSheet.setFrozenRows(1);
+  outputSheet.getRange(2, 1, allRows.length, numCols).setValues(allRows);
+  outputSheet.setFrozenRows(2);
   outputSheet.setFrozenColumns(1);
 
   const elapsed = Date.now() - t0;
