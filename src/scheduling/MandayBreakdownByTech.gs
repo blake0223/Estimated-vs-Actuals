@@ -121,7 +121,6 @@ function generateMandayBreakdownByTech() {
         }
       }
     }
-    }
   }
 
   console.log('Row-to-tech mapping: ' +
