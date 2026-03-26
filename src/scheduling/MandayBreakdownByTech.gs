@@ -85,16 +85,17 @@ function generateMandayBreakdownByTech() {
   const headerKeys = headerWeeks.map(weekOrdinal_);
 
   // ---- 5. Determine which tech owns each schedule row ----
-  //   Scan every grey cell in a row; the first one matching a known TechList name wins.
-  //   Use the canonical display name from TechList, not the grey cell text.
+  //   Scan ALL cells in each row (not just grey) for a known TechList name.
+  //   Use the canonical display name from TechList.
   const rowToTech = {};  // rowIndex -> display name from TechList
-  for (let i = 0; i < greyCellNames.length; i++) {
-    for (let j = 0; j < (greyCellNames[i] || []).length; j++) {
-      const name = greyCellNames[i][j];
-      if (!name) continue;
-      const norm = name.toLowerCase();
+  for (let i = 0; i < scheduleData.length; i++) {
+    if (i === 1 || i === 2) continue; // skip structural rows
+    for (let j = 0; j < scheduleData[i].length; j++) {
+      const cellText = String(scheduleData[i][j] || '').trim();
+      if (!cellText) continue;
+      const norm = cellText.toLowerCase();
       if (techSeries[norm]) {
-        rowToTech[i] = techDisplayNames[norm] || name;
+        rowToTech[i] = techDisplayNames[norm] || cellText;
         break; // first known tech name in this row wins
       }
     }
